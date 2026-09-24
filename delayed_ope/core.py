@@ -180,13 +180,13 @@ def _fmt_est(tag: str, est: Estimate) -> str:
     )
 
 
-def _finite_float(x, what: str) -> float:
+def _finite_float(x, what: str, exc: type = InvalidLogError) -> float:
     if isinstance(x, bool) or not isinstance(x, (int, float)):
-        raise InvalidLogError(
+        raise exc(
             f"{what} 必须是有限实数，得到 {type(x).__name__}")
     fx = float(x)
     if not math.isfinite(fx):
-        raise InvalidLogError(f"{what} 拒绝 NaN/Infinity，得到 {x!r}")
+        raise exc(f"{what} 拒绝 NaN/Infinity，得到 {x!r}")
     return fx
 
 
@@ -231,11 +231,26 @@ def _validate_policy(
     policy: Mapping[object, Mapping[object, float]],
     events: Sequence[LogEvent],
 ) -> None:
+    _check_policy_rows(
+        policy,
+        {e.context for e in events},
+        {(e.context, e.action) for e in events},
+    )
+
+
+def _check_policy_rows(
+    policy: Mapping[object, Mapping[object, float]],
+    contexts_in_log,
+    logged_pairs,
+) -> None:
+    """校验目标策略表：覆盖日志 context/动作、概率合法且每行归一。
+
+    供 :func:`evaluate` 与轨迹评估共用；``contexts_in_log`` 为日志中出现的
+    context 集合，``logged_pairs`` 为日志中出现的 (context, action) 对集合。
+    """
     if not isinstance(policy, Mapping):
         raise InvalidPolicyError(
             "target_policy 必须是 Mapping[context, Mapping[action, prob]]")
-    contexts_in_log = {e.context for e in events}
-    logged_pairs = {(e.context, e.action) for e in events}
     for ctx in contexts_in_log:
         if ctx not in policy:
             raise InvalidPolicyError(

@@ -15,8 +15,11 @@ import time
 from delayed_ope import (
     LogEvent,
     NoMatureSamplesError,
+    Trajectory,
+    TrajectoryStep,
     ZeroSupportError,
     evaluate,
+    evaluate_trajectories,
 )
 
 CONTEXTS = ("news", "music", "shop")
@@ -140,5 +143,82 @@ def main() -> None:
     print(f"实际计算耗时 {time.perf_counter() - t0:.3f} 秒（无 sleep）。")
 
 
+# ---- 多步轨迹演示（<=5 步）：TIS / PDIS 对照小 MDP 枚举真值 --------------
+MDP_STATES = ("s0", "s1")
+MDP_ACTIONS = ("a0", "a1")
+MDP_P0 = {"s0": 0.5, "s1": 0.5}
+MDP_MU = {  # 行为策略
+    "s0": {"a0": 0.75, "a1": 0.25},
+    "s1": {"a0": 0.25, "a1": 0.75},
+}
+MDP_PI = {  # 目标策略
+    "s0": {"a0": 0.25, "a1": 0.75},
+    "s1": {"a0": 0.50, "a1": 0.50},
+}
+MDP_REWARD = {
+    "s0": {"a0": 1.0, "a1": -0.5},
+    "s1": {"a0": 0.25, "a1": 2.0},
+}
+MDP_HORIZON = 4
+N_TRAJECTORIES = 20000
+
+
+def mdp_true_value() -> float:
+    """按 MDP 分布定义递归枚举的精确 V(pi)（独立于 delayed_ope）。"""
+    def v(x, t):
+        if t > MDP_HORIZON:
+            return 0.0
+        nxt = "s1" if x == "s0" else "s0"  # 动作 a1 翻转状态，a0 停留
+        return sum(
+            MDP_PI[x][a] * (MDP_REWARD[x][a]
+                            + v(nxt if a == "a1" else x, t + 1))
+            for a in MDP_ACTIONS)
+
+    return sum(MDP_P0[x] * v(x, 1) for x in MDP_STATES)
+
+
+def generate_trajectories(seed: int) -> list[Trajectory]:
+    rng = random.Random(seed)
+    trajs = []
+    for _ in range(N_TRAJECTORIES):
+        x = "s0" if rng.random() < MDP_P0["s0"] else "s1"
+        steps = []
+        for _ in range(MDP_HORIZON):
+            a = "a0" if rng.random() < MDP_MU[x]["a0"] else "a1"
+            steps.append(TrajectoryStep(x, a, MDP_REWARD[x][a], MDP_MU[x][a]))
+            if a == "a1":
+                x = "s1" if x == "s0" else "s0"
+        trajs.append(Trajectory(tuple(steps)))
+    return trajs
+
+
+def trajectory_demo() -> None:
+    print()
+    print("=" * 68)
+    print(f"多步完整轨迹（{MDP_HORIZON} 步）：TIS / PDIS 对照枚举真值")
+    print("=" * 68)
+    trajs = generate_trajectories(seed=20260924)
+    res = evaluate_trajectories(trajs, MDP_PI)
+    print(res.summary())
+    v = mdp_true_value()
+    print(f"枚举真值 V(pi) = {v:.12g}")
+    print(f"偏差：TIS {res.tis - v:+.4g}，PDIS {res.pdis - v:+.4g}"
+          "（随机日志上仅有统计一致性；普查恒等见测试）")
+    d = res.diagnostics
+    print(f"有效权重诊断：末步 ESS={d.ess:.1f}/{res.n_trajectories}，"
+          f"逐步 ESS 随累乘步数下降（权重退化显式可见）")
+
+    # 实际触发的拒绝：某步行为概率为 0 而目标策略概率为正。
+    bad = list(trajs) + [Trajectory((
+        TrajectoryStep("s0", "a1", 1.0, 0.5),
+        TrajectoryStep("s1", "a0", 1.0, 0.0),   # 行为策略在此步零支持
+    ))]
+    try:
+        evaluate_trajectories(bad, MDP_PI)
+    except ZeroSupportError as exc:
+        print(f"[拒绝 3] ZeroSupportError: {exc}")
+
+
 if __name__ == "__main__":
     main()
+    trajectory_demo()
