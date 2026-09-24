@@ -1,8 +1,14 @@
-# delayed_ope —— 含延迟结算反馈的离线策略评估（可复用库）
+# delayed_ope —— 离线策略评估可复用库（单步延迟结算 + 多步轨迹）
 
-纯 Python 标准库实现的离线策略评估（OPE）模块。处理推荐/决策日志中**回报延迟
-结算**的情形：在固定评估截止时刻，只用已经观察到回报的成熟样本，计算目标策略
-的 IPS、SNIPS、Doubly Robust（DR）估计；未成熟样本**绝不按 reward=0 计入**。
+纯 Python 标准库实现的离线策略评估（OPE）模块，包含两组入口：
+
+1. **单步延迟结算**：推荐/决策日志中**回报延迟结算**的情形。在固定评估
+   截止时刻，只用已经观察到回报的成熟样本，计算目标策略的 IPS、SNIPS、
+   Doubly Robust（DR）估计；未成熟样本**绝不按 reward=0 计入**。
+2. **多步轨迹（本次新增）**：最多 **5 步**的完整轨迹，**逐步累乘**目标
+   与行为策略概率，给出轨迹重要性采样（IS/SNIS）与**逐决策**
+   （per-decision PD-IS/PD-SNIS）估计，附有效权重诊断；行为概率为零而
+   目标概率为正的输入整体拒绝；真值用小 MDP 枚举对照。
 
 - Python 版本：**3.14.7**（仅使用 3.10+ 通用语法，标准库；无任何第三方依赖）
 - 运行环境：Linux 原生；装好 Python 后无需安装其他依赖
@@ -12,22 +18,25 @@
 ## 运行命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（23 个测试方法，其中枚举含 369 个恒等用例）
-python demo.py                            # 约 0.1 秒完成的固定输入演示（上限约 8 秒）
+python -m unittest discover -s tests -v   # 全部测试（44 个测试方法）
+python demo.py                            # 约 0.2 秒完成的固定输入演示（上限 90 秒）
 ```
 
-在仓库根目录执行。`tests/independent_reference.py` 是**独立参考**：它不导入
-被测核心，期望值按有限分布定义直接代数求和；测试中的标量期望亦按公式手算。
+在仓库根目录执行。`tests/independent_reference.py`（单步）与
+`tests/mdp_reference.py`（轨迹）都是**独立参考**：它们不导入被测核心，
+期望值按分布定义直接代数求和/枚举；测试中的标量期望亦按公式手算。
 被测核心只产出待核对的值，不参与期望值的生成。
 
 ## 目录
 
 ```
 delayed_ope/__init__.py   公开接口
-delayed_ope/core.py       核心算法与全部校验
-tests/independent_reference.py  独立分布参考（不依赖被测核心）
-tests/test_ope.py         必要测试
-demo.py                   固定种子数据生成 + 正常结果 + 两个真实触发的拒绝边界
+delayed_ope/core.py       核心算法与全部校验（单步 + 轨迹）
+tests/independent_reference.py  独立分布参考（单步，不依赖被测核心）
+tests/mdp_reference.py          小 MDP 枚举/反向递推参考（轨迹）
+tests/test_ope.py         单步必要测试
+tests/test_trajectories.py     轨迹必要测试
+demo.py                   固定种子数据生成 + 正常结果 + 边界与实际拒绝
 ```
 
 ## 数据结构与接口
@@ -109,18 +118,77 @@ DR 退化为已实现 context 序列上 m_π 的平均值，不再有权重噪�
 后的 IPS/SNIPS/DR 与 ESS。截断统一作用于三个估计量中的权重。输出中两组并列：
 截断提高 ESS（降低方差）但引入偏差，取舍不被隐藏。
 
+## 多步轨迹评估（逐步累乘，最多 5 步）
+
+```python
+from delayed_ope import Step, Trajectory, evaluate_trajectories
+
+# 每步直接给状态、动作、奖励、行为策略概率 mu(a|s)、目标策略概率 pi(a|s)
+traj = Trajectory((
+    Step(state, action, reward, logged_prob, target_prob),  # t=0
+    ...                                                     # 最多 5 步
+), discount=1.0)
+
+result = evaluate_trajectories([traj, ...])   # 纯函数，无概率表参数
+```
+
+`Step` 字段：`state`/`action`（可哈希）、`reward`（有限实数）、
+`logged_prob`、`target_prob`（均为 [0,1] 有限实数；bool 拒绝）。
+`Trajectory` 字段：`steps: tuple[Step, ...]`（长度 **1..5**）、
+`discount ∈ [0,1]`（默认 1.0；同一批次必须统一，否则拒绝）。变长轨迹
+（不同轨迹步数不同）允许，`horizon` 字段报告批次最大步数。
+
+逐步累乘前缀权重 `ρ_{0:t} = Π_{j=0}^{t} pi(a_j|s_j)/mu(a_j|s_j)`，
+轨迹折扣回报 `G = Σ_t γ^t r_t`。返回 `TrajectoryEvaluationResult`：
+
+- `n_trajectories, horizon, discount`
+- `estimate: TrajectoryEstimate`：
+  - **轨迹 IS** `(1/N) Σ_τ W_τ G_τ`，`W_τ = ρ_{0:L-1}`
+  - **轨迹 SNIS** `Σ W_τ G_τ / Σ W_τ`
+  - **逐决策 PD-IS** `(1/N) Σ_τ Σ_t γ^t ρ_{0:t} r_t`
+  - **逐决策 PD-SNIS** `Σ_τ Σ_t γ^t ρ_{0:t} r_t / Σ_τ (1/Γ(L_τ)) Σ_t γ^t ρ_{0:t}`，
+    其中 `Γ(L)=Σ_{t=0}^{L-1}γ^t`（γ=1 时即 L）；mu=pi 时每轨迹分母项
+    期望恰为 1，等长/变长、任意 γ 下普查比值都回到平均折扣回报
+  - `snis`/`pd_snis` 在对应权重和为 0 时为 `None`（0/0 无定义）
+- `weights: WeightDiagnostics`：终权重 `n/min/max/mean/ess`
+  （`ESS=(ΣW)²/ΣW²`），以及逐决策前缀权重的 `n_decision/decision_ess`
+  （跨全部 (轨迹, t) 决策点）。
+
+### 逐决策为什么方差更低
+
+`r_t` 只依赖截至 t 的历史，其无偏重要性权重只需累乘到 t，不必乘以后续
+因子 `ρ_{t+1:L-1}`（条件期望为 1 但贡献方差）。这是**期望恒等**（普查
+精确核对）而非逐样本方差保证：单次抽样上 PD 误差未必更小，demo 只展示
+本次固定种子的实际数字。
+
+### 轨迹零支持与溢出（严格）
+
+- **全部轨迹全部步**校验：任一步 `target_prob>0` 且 `logged_prob==0` →
+  `ZeroSupportError`，不返回任何估计（即使该步之前的因子已把累乘归 0，
+  结构性不相容也不被掩盖）。
+- `target_prob==0` 且 `logged_prob==0`：该因子取 **0**，累乘权重在该处
+  归 0，合法；全部终权重为 0 时 IS=PD-IS=0、SNIS=PD-SNIS=`None`、
+  ESS=0，退化口径显式暴露。
+- **任一前缀权重**（不止终权重）超过 `MAX_WEIGHT` →
+  `WeightOverflowError`：PD 估计实际使用每个前缀，终权重不溢出不能掩盖
+  前缀溢出。`1/μ` 单因子非有限同样拒绝。
+- 非法结构（空批次/空轨迹、步数越界、steps 非 tuple、元素非 Step、
+  概率/奖励 NaN/Infinity 或越界、折扣越界/批次不统一、state/action
+  不可哈希、bool 占据数值位置）→ `InvalidTrajectoryError`。
+
 ## 错误语义（非法输入不静默纠正，错误可定位）
 
 所有错误继承 `OPEError`；消息带字段名/`events[i]` 位置：
 
 | 异常 | 触发 |
 |---|---|
-| `InvalidLogError` | 数值 NaN/Infinity；`cutoff`/reward/时间非有限实数；propensity ∉ [0,1]；t_o<t_d；context/action 不可哈希；事件数超上限；容器或元素类型错 |
+| `InvalidLogError` | 单步事件数值 NaN/Infinity；`cutoff`/reward/时间非有限实数；propensity ∉ [0,1]；t_o<t_d；context/action 不可哈希；事件数超上限；容器或元素类型错 |
+| `InvalidTrajectoryError` | 轨迹批次/元素/steps 类型错；空批次或空轨迹；步数 ∉ [1,5]；概率/奖励 NaN/Infinity 或越界；`discount` ∉ [0,1] 或批次内不统一；state/action 不可哈希；bool 占据数值位置；轨迹数超上限 |
 | `InvalidPolicyError` | 概率表缺 context 行/缺日志动作（漏写不隐式当 0）、概率越界、行和与 1 偏差超容差、动作数超上限、`clip_value` 非法 |
 | `InvalidQHatError` | q_hat 非映射、缺成熟行所需动作取值、值非有限实数 |
-| `ZeroSupportError` | π>0 而 logged_propensity==0 |
-| `WeightOverflowError` | 成熟样本权重 > 1e300 |
-| `NoMatureSamplesError` | cutoff 前无成熟样本 |
+| `ZeroSupportError` | π>0 而 logged 概率==0（单步对全部事件；轨迹对全部步） |
+| `WeightOverflowError` | 单步成熟样本权重 > 1e300；轨迹任一前缀累乘权重 > 1e300 |
+| `NoMatureSamplesError` | cutoff 前无成熟样本（仅单步入口） |
 
 - 所有**数值参数**（含 `cutoff`、`clip_value`、概率、reward、时间、q 值）
   拒绝 `NaN` 与正负 `Infinity`；**整数/数值位置拒绝 `bool`**（`True/False`
@@ -132,10 +200,12 @@ DR 退化为已实现 context 序列上 m_π 的平均值，不再有权重噪�
 
 | 项 | 上限 |
 |---|---|
-| 事件数 | 1,000,000（`MAX_EVENTS`） |
+| 单步事件数 | 1,000,000（`MAX_EVENTS`） |
+| 轨迹数 | 1,000,000（`MAX_TRAJECTORIES`） |
+| 每条轨迹步数 | 1..5（`MAX_HORIZON`） |
 | 每 context 动作数 | 100,000（`MAX_ACTIONS_PER_CONTEXT`） |
-| 单个重要性权重 | 1e300（`MAX_WEIGHT`，超出抛 `WeightOverflowError`） |
-| 概率行归一容差 | `|Σp − 1| ≤ 1e-9`（`PROB_SUM_TOL`） |
+| 单个重要性权重 | 1e300（`MAX_WEIGHT`，超出抛 `WeightOverflowError`；轨迹检查每个前缀） |
+| 概率行归一容差 | `|Σp − 1| ≤ 1e-9`（`PROB_SUM_TOL`，仅单步概率表入口） |
 
 短演示不穷举上限规模。时间值为可比较的有限实数，本库不实现时区/时钟语义。
 
@@ -150,6 +220,13 @@ DR 退化为已实现 context 序列上 m_π 的平均值，不再有权重噪�
 - 随机（非普查）日志上只存在统计一致性，不存在逐样本恒等：测试中对 IPS/SNIPS
   仅用宽松统计带（4000 样本、固定种子，|误差|≤0.2）核对；完美 q_hat 的 DR 仍
   按精确口径 `≤1e-12` 核对（校正项必须精确为 0）。
+- **轨迹枚举测试的误差口径**：在 3 状态、2 动作、确定性转移/奖励的小 MDP
+  上，按 μ 的整数多重数构造普查轨迹（每种动作序列出现次数严格正比于
+  P_μ(序列)），对 horizon L=1..5、γ∈{1,0.5,0}、两套策略（含 π=0 孔）共
+  30 个配置，以及一个变长混批配置，要求 IS/SNIS/PD-IS/PD-SNIS 与枚举真值
+  之差满足 `|估计 − 真值| ≤ 1e-9 · max(1, |真值|)`。真值由**两条互相
+  独立**的算法给出并互相核对：按 π 分布直接枚举序列，与 Bellman 反向
+  策略评估递推。多步累乘使误差随步数积累，故口径较单步普查略宽。
 - 权重与概率为 IEEE-754 binary64；`1/μ` 的相对误差为常规舍入量级（~1e-16）。
 - 本库只实现本题契约的有限数学子集（离散 context/action、实数标量、有限时间
   实数），不宣称任何行业标准协议兼容性。
@@ -167,13 +244,25 @@ DR 退化为已实现 context 序列上 m_π 的平均值，不再有权重噪�
    期望恒等且 q̂ 完美时精确无偏；代价是 q_hat 必须覆盖成熟行的全部动作。
 5. **截断是后处理而非唯一输出**：偏差/方差两组数字并列，调用方自行取舍。
 6. 概率表要求对日志中出现的动作**显式列值**，避免“字典漏键被静默当 0”。
+7. **轨迹概率随步自带**而非另传概率表：多步日志的策略本就可能随时段/版本
+   变化，逐步给值最贴近数据；代价是不校验跨轨迹一致性，按原值累乘。
+8. **PD-SNIS 用 Γ(L) 归一分母**而非裸决策点计数：使任意折扣、变长轨迹下
+   普查恒等都成立（mu=pi 时每轨迹分母项期望恰为 1）。
+9. **前缀溢出独立于终权重拒绝**：逐决策估计实际使用每个前缀，0 吸收导致
+   终权重很小也不能豁免中间前缀的溢出。
 
 ## 已知限制
 
-- 不提供置信区间/SE（可由 `Estimate` 字段在调用方自行 bootstrap）。
-- 不做随机/上下文 embedding 策略，仅离散概率表；目标策略须为调用方持有的
-  完整映射。
-- 不处理同一决策的多值/序列回报、回报删失（censoring）与观察过程的选择性
-  偏差；前提是“到期即可观察”的无信息删失。
-- 无流式/增量接口；一次调用处理一个批次（上限 1e6 事件，内存 O(事件数)）。
+- 不提供置信区间/SE（可由结果字段在调用方自行 bootstrap）。
+- 不做随机/上下文 embedding 策略，仅离散概率表；单步入口的目标策略须为
+  调用方持有的完整映射。
+- 单步入口不处理同一决策的多值/序列回报、回报删失（censoring）与观察
+  过程的选择性偏差；前提是“到期即可观察”的无信息删失。
+- 轨迹入口的范围按本题契约限定：**无延迟结算/删失语义**（轨迹视为完整
+  观测）、**无自适应截断**、无 DR 版本；概率随每步显式给出，不校验跨
+  轨迹的策略一致性（同一状态可出现不同概率，按日志原值累乘）。
+- 轨迹 ESS 为描述性诊断，不是偏差/置信区间保证；逐决策“方差更低”是
+  期望性质，不构成逐样本承诺。
+- 无流式/增量接口；一次调用处理一个批次（上限 1e6 条/事件，内存
+  O(事件数 + 全部决策步)）。
 - q_hat 两种键形式（扁平 tuple 键 / 嵌套映射）同时给出时以扁平键为准。

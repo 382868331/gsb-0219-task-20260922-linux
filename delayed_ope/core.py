@@ -49,9 +49,16 @@ __all__ = [
     "LogEvent",
     "Estimate",
     "EvaluationResult",
+    "Step",
+    "Trajectory",
+    "WeightDiagnostics",
+    "TrajectoryEstimate",
+    "TrajectoryEvaluationResult",
     "evaluate",
+    "evaluate_trajectories",
     "OPEError",
     "InvalidLogError",
+    "InvalidTrajectoryError",
     "InvalidPolicyError",
     "InvalidQHatError",
     "ZeroSupportError",
@@ -61,6 +68,8 @@ __all__ = [
 
 # ---- 接口边界（题面上限；短演示不必穷举） -------------------------------
 MAX_EVENTS = 1_000_000
+MAX_TRAJECTORIES = 1_000_000
+MAX_HORIZON = 5
 MAX_ACTIONS_PER_CONTEXT = 100_000
 # 允许的最大权重；比值超过此值视为数值溢出而非合法极大权重。
 MAX_WEIGHT = 1e300
@@ -74,6 +83,10 @@ class OPEError(Exception):
 
 class InvalidLogError(OPEError):
     """日志事件结构或取值非法（含 NaN/Infinity、时序矛盾等）。"""
+
+
+class InvalidTrajectoryError(OPEError):
+    """轨迹/决策步结构或取值非法（空轨迹、超步长、概率越界等）。"""
 
 
 class InvalidPolicyError(OPEError):
@@ -180,13 +193,13 @@ def _fmt_est(tag: str, est: Estimate) -> str:
     )
 
 
-def _finite_float(x, what: str) -> float:
+def _finite_float(x, what: str, exc: type = InvalidLogError) -> float:
     if isinstance(x, bool) or not isinstance(x, (int, float)):
-        raise InvalidLogError(
+        raise exc(
             f"{what} 必须是有限实数，得到 {type(x).__name__}")
     fx = float(x)
     if not math.isfinite(fx):
-        raise InvalidLogError(f"{what} 拒绝 NaN/Infinity，得到 {x!r}")
+        raise exc(f"{what} 拒绝 NaN/Infinity，得到 {x!r}")
     return fx
 
 
@@ -451,4 +464,295 @@ def evaluate(
         clipped=clipped_est,
         clip_value=clip_value,
         q_hat_used=q_hat is not None,
+    )
+
+
+# =========================================================================
+# 轨迹版：最多 MAX_HORIZON 步的完整轨迹，逐步累乘权重
+# =========================================================================
+#
+# 一条轨迹 tau = ((s0,a0,r0), ..., (s_{L-1},a_{L-1},r_{L-1}))，
+# 1 <= L <= MAX_HORIZON。策略概率在每一步直接给出：
+#
+#     mu_prob_t = 记录策略概率 mu(a_t | s_t)
+#     pi_prob_t = 目标策略概率 pi(a_t | s_t)
+#
+# 逐步累乘的轨迹重要性权重：
+#
+#     rho_{t:k} = prod_{j=t}^{k} pi(a_j|s_j) / mu(a_j|s_j)
+#     W_tau    = rho_{0:L-1}
+#
+# 单条轨迹回报 G = sum_t gamma^t r_t（默认 gamma=1）。
+#
+# 估计量（N 条轨迹）：
+#
+#     轨迹 IS   = (1/N) sum_tau W_tau G_tau
+#     轨迹 SNIS = sum_tau W_tau G_tau / sum_tau W_tau
+#
+# 逐决策（per-decision）估计量利用奖励的时序结构：r_t 只依赖截至 t 的
+# 历史，故其无偏权重只需累乘到 t：
+#
+#     PD-IS   = (1/N) sum_tau sum_t gamma^t rho_{0:t} r_t
+#     PD-SNIS = sum_tau sum_t gamma^t rho_{0:t} r_t
+#               / sum_tau [ (1/Gamma(L_tau)) sum_t gamma^t rho_{0:t} ]
+#
+# 其中 Gamma(L) = sum_{t=0}^{L-1} gamma^t。分母项在 mu=pi 时期望恰为 1，
+# 故等长/变长轨迹、gamma 任意取值，普查上比值都回到平均折扣回报，与
+# PD-IS 同尺度；gamma=1 时 Gamma(L)=L，即“逐决策平均权重”。
+#
+# 零支持拒绝对**全部步**执行：任一步 pi>0 而 mu==0，整条评估被拒绝，
+# 不返回任何估计。pi==0 且 mu==0 的步该因子取 0（累乘权重在该处归 0）。
+
+
+@dataclass(frozen=True)
+class Step:
+    """轨迹中的一个决策步 (state, action, reward, mu_prob, pi_prob)。
+
+    与 :class:`LogEvent` 不同，目标策略概率直接随步给出（轨迹评估按逐步
+    概率对累乘，无需另行传入概率表）。
+    """
+
+    state: object
+    action: object
+    reward: float
+    logged_prob: float
+    target_prob: float
+
+
+@dataclass(frozen=True)
+class Trajectory:
+    """一条完整轨迹：1..MAX_HORIZON 个 :class:`Step`，可选折扣因子。"""
+
+    steps: tuple[Step, ...]
+    discount: float = 1.0
+
+
+@dataclass(frozen=True)
+class WeightDiagnostics:
+    """有效权重诊断（全部基于实际使用的权重，拒绝时不产出）。
+
+    轨迹级量（每个轨迹一个终权重 W_tau=逐步累乘到末步）：
+    ``n, min, max, mean, ess``（ESS=(ΣW)²/ΣW²，全零权重时 0）。
+    逐决策级量（每个 (轨迹, t) 一个前缀累乘权重 rho_{0:t}）：
+    ``n_decision, decision_ess``。
+    """
+
+    n: int
+    min: float
+    max: float
+    mean: float
+    ess: float
+    n_decision: int
+    decision_ess: float
+
+
+@dataclass(frozen=True)
+class TrajectoryEstimate:
+    """轨迹评估的四个估计量。
+
+    ``snis`` / ``pd_snis`` 在对应权重和为 0 时为 ``None``（0/0 无定义）。
+    """
+
+    is_: float
+    snis: float | None
+    pd_is: float
+    pd_snis: float | None
+
+
+@dataclass(frozen=True)
+class TrajectoryEvaluationResult:
+    """轨迹评估结果。"""
+
+    n_trajectories: int
+    horizon: int
+    discount: float
+    estimate: TrajectoryEstimate
+    weights: WeightDiagnostics
+
+    def summary(self) -> str:
+        e, w = self.estimate, self.weights
+        snis = "undefined" if e.snis is None else f"{e.snis:.12g}"
+        pd_snis = "undefined" if e.pd_snis is None else f"{e.pd_snis:.12g}"
+        return "\n".join([
+            f"n_trajectories={w.n}, horizon={self.horizon}, "
+            f"discount={self.discount:g}",
+            f"[trajectory] IS={e.is_:.12g}, SNIS={snis}",
+            f"[per-decision] PD-IS={e.pd_is:.12g}, PD-SNIS={pd_snis}",
+            f"权重诊断: 终权重 min={w.min:.6g} max={w.max:.6g} "
+            f"mean={w.mean:.6g}",
+            f"          轨迹 ESS={w.ess:.6g}/{w.n}, "
+            f"逐决策 ESS={w.decision_ess:.6g}/{w.n_decision}",
+        ])
+
+
+def _validate_step(s: Step, where: str) -> None:
+    if not isinstance(s, Step):
+        raise InvalidTrajectoryError(
+            f"{where} 必须是 Step，得到 {type(s).__name__}")
+    _finite_float(s.reward, f"{where}.reward", InvalidTrajectoryError)
+    _finite_prob(s.logged_prob, f"{where}.logged_prob",
+                 InvalidTrajectoryError)
+    _finite_prob(s.target_prob, f"{where}.target_prob",
+                 InvalidTrajectoryError)
+    try:
+        hash(s.state)
+        hash(s.action)
+    except TypeError as exc:
+        raise InvalidTrajectoryError(
+            f"{where}: state/action 必须可哈希") from exc
+
+
+def _validate_trajectories(
+    trajectories: Sequence[Trajectory],
+) -> float:
+    """校验全部轨迹；返回应使用的统一折扣（要求各轨迹一致）。"""
+    if not isinstance(trajectories, Sequence):
+        raise InvalidTrajectoryError(
+            "trajectories 必须是 Trajectory 的序列（Sequence）")
+    if len(trajectories) > MAX_TRAJECTORIES:
+        raise InvalidTrajectoryError(
+            f"轨迹数 {len(trajectories)} 超过接口上限 {MAX_TRAJECTORIES}")
+    if len(trajectories) == 0:
+        raise InvalidTrajectoryError("trajectories 为空：至少需要一条轨迹")
+    discount_ref: float | None = None
+    for k, traj in enumerate(trajectories):
+        where = f"trajectories[{k}]"
+        if not isinstance(traj, Trajectory):
+            raise InvalidTrajectoryError(
+                f"{where} 必须是 Trajectory，得到 {type(traj).__name__}")
+        steps = traj.steps
+        if not isinstance(steps, tuple):
+            raise InvalidTrajectoryError(
+                f"{where}.steps 必须是 tuple[Step, ...]")
+        if not (1 <= len(steps) <= MAX_HORIZON):
+            raise InvalidTrajectoryError(
+                f"{where} 步数={len(steps)} 越界：每条轨迹步数须在 "
+                f"[1, {MAX_HORIZON}]")
+        if isinstance(traj.discount, bool) or not isinstance(
+                traj.discount, (int, float)):
+            raise InvalidTrajectoryError(
+                f"{where}.discount 必须是实数，得到 "
+                f"{type(traj.discount).__name__}")
+        d = float(traj.discount)
+        if not math.isfinite(d) or not (0.0 <= d <= 1.0):
+            raise InvalidTrajectoryError(
+                f"{where}.discount={d!r} 越界：须为 [0,1] 内有限实数")
+        if discount_ref is None:
+            discount_ref = d
+        elif d != discount_ref:
+            raise InvalidTrajectoryError(
+                f"{where}.discount={d:g} 与首条轨迹的 "
+                f"{discount_ref:g} 不一致；批次内折扣必须统一")
+        for t, s in enumerate(steps):
+            _validate_step(s, f"{where}.steps[{t}]")
+    assert discount_ref is not None
+    return discount_ref
+
+
+def evaluate_trajectories(
+    trajectories: Sequence[Trajectory],
+) -> TrajectoryEvaluationResult:
+    """轨迹离线策略评估：逐步累乘重要性权重（纯函数，无副作用）。
+
+    每条轨迹 1..``MAX_HORIZON``（5）步，概率随每个 :class:`Step` 直接给出。
+    返回轨迹 IS/SNIS 与逐决策 PD-IS/PD-SNIS，以及终权重与前缀权重的有效
+    权重诊断（min/max/mean/ESS/逐决策 ESS）。
+
+    错误语义
+    --------
+    * 容器/元素类型错、空序列、空轨迹、步数不在 [1,5]、折扣越界或批次内
+      不统一、概率/奖励 NaN/Infinity、bool 占据数值位置 ->
+      :class:`InvalidTrajectoryError`；
+    * 任一步 ``target_prob > 0`` 而 ``logged_prob == 0`` ->
+      :class:`ZeroSupportError`（对全部轨迹全部步校验）；
+    * 任一累乘权重（终权重或任一前缀）超过 ``MAX_WEIGHT`` ->
+      :class:`WeightOverflowError`。
+
+    所有校验在构造结果前完成，失败不返回任何估计值，也不修改输入。
+    """
+    discount = _validate_trajectories(trajectories)
+
+    # 零支持对全部步校验（结构性不相容，与权重在哪一项使用无关）。
+    for k, traj in enumerate(trajectories):
+        for t, s in enumerate(traj.steps):
+            if s.target_prob > 0.0 and s.logged_prob == 0.0:
+                raise ZeroSupportError(
+                    f"零支持拒绝（trajectories[{k}].steps[{t}]）："
+                    f"state={s.state!r}, action={s.action!r}，"
+                    f"目标概率={s.target_prob:g} 而记录策略概率="
+                    f"{s.logged_prob:g}；轨迹权重无定义")
+
+    n = len(trajectories)
+    horizon = max(len(tr.steps) for tr in trajectories)
+
+    final_w: list[float] = []          # 每轨迹终权重 W_tau
+    weighted_returns: list[float] = [] # W_tau * G_tau
+    pd_num_terms: list[float] = []     # 每轨迹 Σ_t gamma^t rho_{0:t} r_t
+    # 逐决策自归一化分母项：每轨迹 (1/L) Σ_t gamma^t rho_{0:t}
+    pd_den_terms: list[float] = []
+    prefix_w_all: list[float] = []     # 全部 (轨迹,t) 前缀权重（诊断）
+
+    for k, traj in enumerate(trajectories):
+        rho = 1.0
+        g = 0.0
+        num_t = 0.0
+        den_t = 0.0
+        gamma_t = 1.0
+        gamma_sum = 0.0  # Gamma(L) = Σ_t gamma^t
+        for t, s in enumerate(traj.steps):
+            if s.target_prob <= 0.0:
+                factor = 0.0
+            else:
+                factor = s.target_prob / s.logged_prob
+                if not math.isfinite(factor):
+                    raise WeightOverflowError(
+                        f"权重溢出（trajectories[{k}].steps[{t}]）："
+                        f"{s.target_prob:g}/{s.logged_prob:g} 非有限")
+            rho *= factor
+            if not math.isfinite(rho) or rho > MAX_WEIGHT:
+                raise WeightOverflowError(
+                    f"累乘权重溢出（trajectories[{k}].steps[{t}]）："
+                    f"前缀权重 rho_{{0:{t}}}={rho:g} 超过上限 "
+                    f"{MAX_WEIGHT:g}")
+            g += gamma_t * s.reward
+            num_t += gamma_t * rho * s.reward
+            den_t += gamma_t * rho
+            gamma_sum += gamma_t
+            prefix_w_all.append(rho)
+            gamma_t *= discount
+        final_w.append(rho)
+        weighted_returns.append(rho * g)
+        pd_num_terms.append(num_t)
+        pd_den_terms.append(den_t / gamma_sum)
+
+    sum_w = math.fsum(final_w)
+    sum_wr = math.fsum(weighted_returns)
+    sum_w2 = math.fsum(w * w for w in final_w)
+    is_est = sum_wr / n
+    snis = sum_wr / sum_w if sum_w > 0.0 else None
+
+    pd_num = math.fsum(pd_num_terms)
+    pd_is = pd_num / n
+    pd_den = math.fsum(pd_den_terms)
+    pd_snis = pd_num / pd_den if pd_den > 0.0 else None
+
+    sum_pw = math.fsum(prefix_w_all)
+    sum_pw2 = math.fsum(w * w for w in prefix_w_all)
+    diag = WeightDiagnostics(
+        n=n,
+        min=min(final_w),
+        max=max(final_w),
+        mean=sum_w / n,
+        ess=(sum_w * sum_w) / sum_w2 if sum_w2 > 0.0 else 0.0,
+        n_decision=len(prefix_w_all),
+        decision_ess=(sum_pw * sum_pw) / sum_pw2 if sum_pw2 > 0.0 else 0.0,
+    )
+
+    return TrajectoryEvaluationResult(
+        n_trajectories=n,
+        horizon=horizon,
+        discount=discount,
+        estimate=TrajectoryEstimate(
+            is_=is_est, snis=snis, pd_is=pd_is, pd_snis=pd_snis),
+        weights=diag,
     )
