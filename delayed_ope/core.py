@@ -42,7 +42,7 @@ q_hat 完美时校正项恒为 0，DR 即退化为确定性的 m_pi 平均。SNI
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
 __all__ = [
@@ -57,6 +57,8 @@ __all__ = [
     "ZeroSupportError",
     "WeightOverflowError",
     "NoMatureSamplesError",
+    "CutoffOutOfOrderError",
+    "IncrementalEvaluation",
 ]
 
 # ---- 接口边界（题面上限；短演示不必穷举） -------------------------------
@@ -96,6 +98,10 @@ class NoMatureSamplesError(OPEError):
     """截止时刻前没有任何成熟样本（全部延迟未观测）。"""
 
 
+class CutoffOutOfOrderError(OPEError):
+    """增量评估的新 cutoff 早于当前 cutoff。"""
+
+
 @dataclass(frozen=True)
 class LogEvent:
     """一条带延迟结算的决策日志。
@@ -114,6 +120,9 @@ class LogEvent:
         决策时刻（可比较的有限实数）。
     observed_time:
         回报可观察时刻（有限实数，且 ``observed_time >= decision_time``）。
+    event_id:
+        可选稳定事件标识。显式提供时必须可哈希且在日志内唯一；不提供时
+        每个事件自动获得一个进程内唯一标识。
     """
 
     context: object
@@ -122,6 +131,7 @@ class LogEvent:
     logged_propensity: float
     decision_time: float
     observed_time: float
+    event_id: object = field(default_factory=object)
 
 
 @dataclass(frozen=True)
@@ -207,6 +217,7 @@ def _validate_events(events: Sequence[LogEvent]) -> None:
     if len(events) > MAX_EVENTS:
         raise InvalidLogError(
             f"事件数 {len(events)} 超过接口上限 {MAX_EVENTS}")
+    seen_ids: set[object] = set()
     for i, e in enumerate(events):
         if not isinstance(e, LogEvent):
             raise InvalidLogError(
@@ -225,6 +236,54 @@ def _validate_events(events: Sequence[LogEvent]) -> None:
         except TypeError as exc:
             raise InvalidLogError(
                 f"{where}: context/action 必须可哈希") from exc
+        try:
+            if e.event_id in seen_ids:
+                raise InvalidLogError(
+                    f"{where}: event_id={e.event_id!r} 重复")
+            seen_ids.add(e.event_id)
+        except TypeError as exc:
+            raise InvalidLogError(
+                f"{where}: event_id 必须可哈希") from exc
+
+
+def _validate_cutoff(cutoff: float) -> float:
+    if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)):
+        raise InvalidLogError(
+            f"cutoff 必须是有限实数，得到 {type(cutoff).__name__}")
+    cutoff = float(cutoff)
+    if not math.isfinite(cutoff):
+        raise InvalidLogError("cutoff 拒绝 NaN/Infinity")
+    return cutoff
+
+
+def _validate_clip_value(clip_value: float | None) -> float | None:
+    if clip_value is None:
+        return None
+    if isinstance(clip_value, bool) or not isinstance(
+            clip_value, (int, float)):
+        raise InvalidPolicyError(
+            "clip_value 必须是正实数或 None，得到 "
+            f"{type(clip_value).__name__}")
+    clip_value = float(clip_value)
+    if not math.isfinite(clip_value) or clip_value <= 0.0:
+        raise InvalidPolicyError(
+            f"clip_value 必须是正有限实数，得到 {clip_value!r}")
+    return clip_value
+
+
+def _freeze_policy(
+    policy: Mapping[object, Mapping[object, float]],
+) -> Mapping[object, Mapping[object, float]]:
+    return {ctx: dict(row) for ctx, row in policy.items()}
+
+
+def _freeze_q_hat(q_hat: Mapping | None) -> Mapping | None:
+    if q_hat is None:
+        return None
+    return {
+        key: dict(value) if isinstance(value, Mapping) else value
+        for key, value in q_hat.items()
+    }
 
 
 def _validate_policy(
@@ -316,6 +375,179 @@ def _compute_estimates(
     return Estimate(ips=ips, snips=snips, dr=dr, ess=ess, n=n)
 
 
+class IncrementalEvaluation:
+    """按观察时间推进的冻结日志评估对象。
+
+    构造时一次性校验并冻结日志、目标策略、q_hat 与截断配置。调用
+    :meth:`advance` 只会纳入 ``observed_time == 新边界`` 的整组样本；
+    同一观察时刻的所有事件要么一起纳入，要么都不纳入。返回结果与对相同
+    冻结输入调用 :func:`evaluate` 在该 cutoff 上的结果一致。
+    """
+
+    def __init__(
+        self,
+        events: Sequence[LogEvent],
+        target_policy: Mapping[object, Mapping[object, float]],
+        q_hat: Mapping | None = None,
+        clip_value: float | None = None,
+    ) -> None:
+        self._clip_value = _validate_clip_value(clip_value)
+        _validate_events(events)
+        _validate_policy(target_policy, events)
+
+        self._events = tuple(events)
+        self._policy = _freeze_policy(target_policy)
+        if q_hat is not None and not isinstance(q_hat, Mapping):
+            raise InvalidQHatError(
+                "q_hat 必须是 Mapping（(ctx,action)->v 或 ctx->(action->v)）")
+        self._q_hat = _freeze_q_hat(q_hat)
+
+        for i, e in enumerate(self._events):
+            p_log = float(e.logged_propensity)
+            p_tgt = float(self._policy[e.context][e.action])
+            if p_tgt > 0.0 and p_log == 0.0:
+                raise ZeroSupportError(
+                    f"零支持拒绝（events[{i}]）：context={e.context!r}, "
+                    f"action={e.action!r}，目标概率={p_tgt:g} 而记录策略概率="
+                    f"{p_log:g}；重要性权重无定义")
+
+        groups: dict[float, list[int]] = {}
+        for i, event in enumerate(self._events):
+            groups.setdefault(float(event.observed_time), []).append(i)
+        self._boundaries = tuple(sorted(groups))
+        self._groups = {boundary: tuple(indices)
+                        for boundary, indices in groups.items()}
+        self._cutoff: float | None = None
+        self._next_pos = 0
+        self._mature_indices: tuple[int, ...] = ()
+        n_events = len(self._events)
+        self._rewards: list[float | None] = [None] * n_events
+        self._weights: list[float | None] = [None] * n_events
+        self._clipped_weights: list[float | None] = [None] * n_events
+        self._m_pi: list[float | None] = [None] * n_events
+        self._q_logged: list[float | None] = [None] * n_events
+
+    @property
+    def cutoff(self) -> float | None:
+        """最近一次声明的截止时刻；尚未推进时为 ``None``。"""
+        return self._cutoff
+
+    @property
+    def mature_indices(self) -> tuple[int, ...]:
+        return self._mature_indices
+
+    def advance(self, cutoff: float) -> EvaluationResult:
+        """推进到不小于当前 cutoff 的新边界并返回当前估计。
+
+        重复使用相同 cutoff 是幂等读取；更小的 cutoff 抛
+        :class:`CutoffOutOfOrderError`。若目标边界前没有成熟样本，抛
+        :class:`NoMatureSamplesError`，且对象保持无成熟样本状态。
+        """
+        new_cutoff = _validate_cutoff(cutoff)
+        if self._cutoff is not None and new_cutoff < self._cutoff:
+            raise CutoffOutOfOrderError(
+                f"cutoff 不允许倒退：当前={self._cutoff:g}，"
+                f"请求={new_cutoff:g}")
+
+        added_indices: list[int] = []
+        while (self._next_pos < len(self._boundaries) and
+               self._boundaries[self._next_pos] <= new_cutoff):
+            added_indices.extend(self._groups[self._boundaries[self._next_pos]])
+            self._next_pos += 1
+
+        self._cutoff = new_cutoff
+        if not self._mature_indices and not added_indices:
+            raise NoMatureSamplesError(
+                f"cutoff={new_cutoff:g} 前无成熟样本："
+                f"{len(self._events)} 条事件的回报均尚未观察到；"
+                "未成熟事件不按 reward=0 计入")
+
+        if added_indices:
+            self._append_group(tuple(added_indices))
+        return self.result()
+
+    def _append_group(self, indices: tuple[int, ...]) -> None:
+        prepared: dict[int, dict[str, float]] = {}
+        q_lookup = (_make_q_lookup(self._q_hat)
+                    if self._q_hat is not None else None)
+
+        for i in indices:
+            event = self._events[i]
+            p_log = float(event.logged_propensity)
+            p_tgt = float(self._policy[event.context][event.action])
+            if p_tgt <= 0.0:
+                weight = 0.0
+            else:
+                weight = p_tgt / p_log
+                if not math.isfinite(weight) or weight > MAX_WEIGHT:
+                    raise WeightOverflowError(
+                        f"权重溢出（events[{i}]，成熟样本）：context="
+                        f"{event.context!r}, action={event.action!r}，"
+                        f"w={p_tgt:g}/{p_log:g} 超过上限 {MAX_WEIGHT:g}")
+            item = {
+                "reward": float(event.reward),
+                "weight": weight,
+            }
+            if self._clip_value is not None:
+                item["clipped_weight"] = min(weight, self._clip_value)
+            if q_lookup is not None:
+                row = self._policy[event.context]
+                q_values = {
+                    action: q_lookup(event.context, action)
+                    for action in row
+                }
+                item["m_pi"] = math.fsum(
+                    float(row[action]) * q_values[action]
+                    for action in row)
+                item["q_logged"] = q_values[event.action]
+            prepared[i] = item
+
+        for i, item in prepared.items():
+            self._rewards[i] = item["reward"]
+            self._weights[i] = item["weight"]
+            if self._clip_value is not None:
+                self._clipped_weights[i] = item["clipped_weight"]
+            if self._q_hat is not None:
+                self._m_pi[i] = item["m_pi"]
+                self._q_logged[i] = item["q_logged"]
+        self._mature_indices = tuple(sorted(
+            self._mature_indices + indices))
+
+    def result(self) -> EvaluationResult:
+        """返回当前已成熟样本上的估计；尚未有成熟样本时拒绝。"""
+        if self._cutoff is None or not self._mature_indices:
+            raise NoMatureSamplesError(
+                "尚未推进到任何包含成熟样本的 cutoff")
+        rewards = [self._rewards[i] for i in self._mature_indices]
+        weights = [self._weights[i] for i in self._mature_indices]
+        clipped_weights = (
+            [self._clipped_weights[i] for i in self._mature_indices]
+            if self._clip_value is not None else None)
+        m_pi = (
+            [self._m_pi[i] for i in self._mature_indices]
+            if self._q_hat is not None else None)
+        q_logged = (
+            [self._q_logged[i] for i in self._mature_indices]
+            if self._q_hat is not None else None)
+        unclipped = _compute_estimates(
+            rewards, weights, m_pi, q_logged)
+        clipped = None
+        if self._clip_value is not None:
+            clipped = _compute_estimates(
+                rewards, clipped_weights, m_pi, q_logged)
+        return EvaluationResult(
+            cutoff=self._cutoff,
+            n_total=len(self._events),
+            n_mature=len(self._mature_indices),
+            n_immature=len(self._events) - len(self._mature_indices),
+            mature_indices=self._mature_indices,
+            unclipped=unclipped,
+            clipped=clipped,
+            clip_value=self._clip_value,
+            q_hat_used=self._q_hat is not None,
+        )
+
+
 def evaluate(
     events: Sequence[LogEvent],
     target_policy: Mapping[object, Mapping[object, float]],
@@ -360,23 +592,8 @@ def evaluate(
       :class:`ZeroSupportError`（对全部事件校验，不受 cutoff 影响）；
     * 权重超过 ``MAX_WEIGHT`` -> :class:`WeightOverflowError`。
     """
-    if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)):
-        raise InvalidLogError(
-            f"cutoff 必须是有限实数，得到 {type(cutoff).__name__}")
-    cutoff = float(cutoff)
-    if not math.isfinite(cutoff):
-        raise InvalidLogError("cutoff 拒绝 NaN/Infinity")
-
-    if clip_value is not None:
-        if isinstance(clip_value, bool) or not isinstance(
-                clip_value, (int, float)):
-            raise InvalidPolicyError(
-                "clip_value 必须是正实数或 None，得到 "
-                f"{type(clip_value).__name__}")
-        clip_value = float(clip_value)
-        if not math.isfinite(clip_value) or clip_value <= 0.0:
-            raise InvalidPolicyError(
-                f"clip_value 必须是正有限实数，得到 {clip_value!r}")
+    cutoff = _validate_cutoff(cutoff)
+    clip_value = _validate_clip_value(clip_value)
 
     _validate_events(events)
     _validate_policy(target_policy, events)

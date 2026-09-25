@@ -13,6 +13,7 @@ import random
 import time
 
 from delayed_ope import (
+    IncrementalEvaluation,
     LogEvent,
     NoMatureSamplesError,
     ZeroSupportError,
@@ -86,6 +87,38 @@ def true_value() -> float:
         for x in CONTEXTS)
 
 
+def incremental_demo() -> None:
+    print("=" * 68)
+    print("按观察时间推进：同一冻结日志在不同截止时刻的估计对象")
+    print("=" * 68)
+    pi = {"x": {"a": 0.7, "b": 0.3}}
+    q_hat = {("x", "a"): 0.8, ("x", "b"): -0.2}
+    # 决策顺序为 0,1,2,2；观察顺序为 4,3,2,2。最后两条同时成熟。
+    staged_events = [
+        LogEvent("x", "a", 2.0, 0.25, 0.0, 4.0, "late-observation"),
+        LogEvent("x", "b", -1.0, 0.75, 1.0, 3.0, "middle"),
+        LogEvent("x", "a", 1.0, 0.35, 2.0, 2.0, "same-time-a"),
+        LogEvent("x", "b", 0.5, 0.65, 2.0, 2.0, "same-time-b"),
+    ]
+    evaluator = IncrementalEvaluation(
+        staged_events, pi, q_hat=q_hat, clip_value=2.0)
+    try:
+        evaluator.advance(1.0)
+    except NoMatureSamplesError as exc:
+        print(f"cutoff=1: {type(exc).__name__}（明确空状态，不把回报当 0）")
+
+    for cutoff in (2.0, 2.0, 3.0, 4.0):
+        result = evaluator.advance(cutoff)
+        batch = evaluate(
+            staged_events, pi, cutoff, q_hat=q_hat, clip_value=2.0)
+        u = result.unclipped
+        print(
+            f"cutoff={cutoff:g}: n={u.n}/4, indices={result.mature_indices}, "
+            f"IPS={u.ips:.6g}, SNIPS={u.snips:.6g}, DR={u.dr:.6g}, "
+            f"ESS={u.ess:.4g}; 与批量入口一致={result == batch}")
+    print("第二次 cutoff=2 是幂等读取；2.0 边界只显示 (2,3) 整组。")
+
+
 def main() -> None:
     t0 = time.perf_counter()
     events = generate_events(seed=20260923)
@@ -112,7 +145,10 @@ def main() -> None:
     perfect_q = {(x, a): REWARD[x][a] for x in CONTEXTS for a in ACTIONS}
     rp = evaluate(events, PI, CUTOFF, q_hat=perfect_q)
     print(f"完美 q_hat 时 DR = {rp.unclipped.dr:.12g}（无权重噪声，"
-          "仅随已实现 context 分布微动）")
+            "仅随已实现 context 分布微动）")
+
+    print()
+    incremental_demo()
 
     print()
     print("=" * 68)

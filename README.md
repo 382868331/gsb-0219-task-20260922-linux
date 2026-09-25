@@ -12,8 +12,8 @@
 ## 运行命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（23 个测试方法，其中枚举含 369 个恒等用例）
-python demo.py                            # 约 0.1 秒完成的固定输入演示（上限约 8 秒）
+./.venv/bin/python -m unittest discover -s tests -v  # 30 个测试方法，含枚举恒等用例
+./.venv/bin/python demo.py                          # 固定输入离线演示，通常约 0.1 秒
 ```
 
 在仓库根目录执行。`tests/independent_reference.py` 是**独立参考**：它不导入
@@ -27,7 +27,7 @@ delayed_ope/__init__.py   公开接口
 delayed_ope/core.py       核心算法与全部校验
 tests/independent_reference.py  独立分布参考（不依赖被测核心）
 tests/test_ope.py         必要测试
-demo.py                   固定种子数据生成 + 正常结果 + 两个真实触发的拒绝边界
+demo.py                   固定数据 + 批量结果 + 逐观察时间推进演示 + 拒绝边界
 ```
 
 ## 数据结构与接口
@@ -67,6 +67,39 @@ result = evaluate(
 
 `Estimate` 字段：`ips, snips, dr, ess, n`。`snips` 在权重和为 0 时为 `None`
 （0/0 无定义）；`dr` 在未给 q_hat 时为 `None`。用 `result.summary()` 可打印。
+
+`LogEvent` 的第 7 个可选字段 `event_id` 用于显式标识事件；一旦提供，必须可
+哈希且全日志唯一，重复 ID 抛 `InvalidLogError`。不提供时使用自动唯一标识，
+不需要调用方维护 ID。
+
+### 按观察时间推进的评估对象
+
+需要逐个查看不同截止时刻时，使用 `IncrementalEvaluation`，不要重新维护第二
+套估计逻辑：
+
+```python
+evaluator = IncrementalEvaluation(
+    events, target_policy, q_hat=q_hat, clip_value=1.5)
+result = evaluator.advance(cutoff)
+```
+
+构造时一次性加载并冻结日志、目标策略、q_hat 与权重截断值；之后修改外部传
+入映射不会影响评估。`advance(cutoff)` 只追加自上一边界以来新成熟的事件，
+并且以 `observed_time` 为原子边界：同一观察时刻的所有记录要么整组纳入，要
+么整组不纳入，不会暴露半组结果。其返回对象与用相同冻结输入调用
+`evaluate(..., cutoff)` 完全相同。
+
+增量契约：
+
+- cutoff 必须是有限实数且拒绝 `bool`；新 cutoff 小于当前 cutoff 时抛
+  `CutoffOutOfOrderError`。
+- 相同 cutoff 重复推进是幂等读取，不重复纳入样本。
+- cutoff 前没有成熟样本时抛 `NoMatureSamplesError`；`evaluator.cutoff`
+  保留已声明边界，`mature_indices` 仍为空元组，`result()` 不会凭空给出 0。
+- 所有累计量在查询时通过 `math.fsum` 对当前成熟样本稳定求和；截断值在构造
+  后固定。
+- 零支持仍在创建时对全部日志校验；权重溢出和 q_hat 取值在相应观察边界整组
+  校验，失败时不提交半组数据。
 
 ### 成熟样本口径（明确定义）
 
@@ -121,6 +154,7 @@ DR 退化为已实现 context 序列上 m_π 的平均值，不再有权重噪�
 | `ZeroSupportError` | π>0 而 logged_propensity==0 |
 | `WeightOverflowError` | 成熟样本权重 > 1e300 |
 | `NoMatureSamplesError` | cutoff 前无成熟样本 |
+| `CutoffOutOfOrderError` | `IncrementalEvaluation.advance` 的 cutoff 倒退 |
 
 - 所有**数值参数**（含 `cutoff`、`clip_value`、概率、reward、时间、q 值）
   拒绝 `NaN` 与正负 `Infinity`；**整数/数值位置拒绝 `bool`**（`True/False`
@@ -175,5 +209,7 @@ DR 退化为已实现 context 序列上 m_π 的平均值，不再有权重噪�
   完整映射。
 - 不处理同一决策的多值/序列回报、回报删失（censoring）与观察过程的选择性
   偏差；前提是“到期即可观察”的无信息删失。
-- 无流式/增量接口；一次调用处理一个批次（上限 1e6 事件，内存 O(事件数)）。
+- `IncrementalEvaluation` 是离线日志的时间推进对象，不接收多步轨迹、在线
+  事件追加或实时服务；构造时仍一次加载完整批次（上限 1e6 事件，内存
+  O(事件数)）。
 - q_hat 两种键形式（扁平 tuple 键 / 嵌套映射）同时给出时以扁平键为准。

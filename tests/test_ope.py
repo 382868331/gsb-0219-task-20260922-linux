@@ -14,6 +14,8 @@ import random
 import unittest
 
 from delayed_ope import (
+    CutoffOutOfOrderError,
+    IncrementalEvaluation,
     InvalidLogError,
     InvalidPolicyError,
     InvalidQHatError,
@@ -450,6 +452,170 @@ class SideEffectTests(unittest.TestCase):
         events = [LogEvent("x", 0, 1.0, 0.5, 0.0, 1.0)]
         evaluate(events, pi, 2.0)
         self.assertEqual(pi, {"x": {0: 0.5, 1: 0.5}})
+
+
+class IncrementalEvaluationTests(unittest.TestCase):
+    def _direct_reference(self, events, pi, cutoff, q_hat=None, clip=None):
+        mature = [e for e in events if e.observed_time <= cutoff]
+        self.assertTrue(mature)
+        weights = []
+        clipped = []
+        rewards = []
+        m_values = []
+        q_values = []
+        for event in mature:
+            weight = pi[event.context][event.action] / event.logged_propensity
+            weights.append(weight)
+            clipped.append(min(weight, clip) if clip is not None else weight)
+            rewards.append(event.reward)
+            if q_hat is not None:
+                row = pi[event.context]
+                m_values.append(math.fsum(
+                    row[a] * q_hat[(event.context, a)] for a in row))
+                q_values.append(q_hat[(event.context, event.action)])
+
+        def estimate(ws):
+            sum_w = math.fsum(ws)
+            sum_wr = math.fsum(w * r for w, r in zip(ws, rewards))
+            sum_w2 = math.fsum(w * w for w in ws)
+            dr = None
+            if q_hat is not None:
+                dr = math.fsum(
+                    m + w * (r - q)
+                    for m, w, r, q in zip(
+                        m_values, ws, rewards, q_values)) / len(mature)
+            return {
+                "ips": sum_wr / len(mature),
+                "snips": sum_wr / sum_w if sum_w != 0.0 else None,
+                "dr": dr,
+                "ess": sum_w * sum_w / sum_w2 if sum_w2 != 0.0 else 0.0,
+                "n": len(mature),
+            }
+
+        return estimate(weights), estimate(clipped) if clip else None
+
+    def _assert_est_equal(self, got, expected):
+        self.assertEqual(got.n, expected["n"])
+        self.assertEqual(got.snips is None, expected["snips"] is None)
+        for key in ("ips", "snips", "dr", "ess"):
+            if expected[key] is None:
+                self.assertIsNone(getattr(got, key))
+            else:
+                self.assertTrue(math.isfinite(getattr(got, key)), key)
+                self.assertAlmostEqual(
+                    getattr(got, key), expected[key], places=10, msg=key)
+
+    def test_boundaries_match_batch_and_direct_formula(self):
+        # 决策顺序与观察顺序相反；事件 2/3 同一观察时刻，必须整组出现。
+        events = [
+            LogEvent("x", 0, 1.0, 0.8, 0.0, 4.0, "e0"),
+            LogEvent("x", 1, -2.0, 0.2, 1.0, 3.0, "e1"),
+            LogEvent("x", 0, 3.0, 0.4, 2.0, 2.0, "e2"),
+            LogEvent("x", 1, 0.5, 0.1, 0.0, 2.0, "e3"),
+        ]
+        pi = {"x": {0: 0.25, 1: 0.75}}
+        q = {("x", 0): 0.3, ("x", 1): -0.4}
+        clip = 2.0
+        evaluator = IncrementalEvaluation(events, pi, q, clip)
+
+        with self.assertRaises(NoMatureSamplesError):
+            evaluator.advance(1.0)
+        self.assertEqual(evaluator.cutoff, 1.0)
+
+        res = evaluator.advance(2.0)
+        self.assertEqual(res.mature_indices, (2, 3))
+        direct_u, direct_c = self._direct_reference(
+            events, pi, 2.0, q, clip)
+        batch = evaluate(events, pi, 2.0, q, clip)
+        self._assert_est_equal(res.unclipped, direct_u)
+        self._assert_est_equal(res.clipped, direct_c)
+        self.assertEqual(res, batch)
+
+        res = evaluator.advance(3.5)
+        self.assertEqual(res.mature_indices, (1, 2, 3))
+        direct_u, direct_c = self._direct_reference(
+            events, pi, 3.5, q, clip)
+        batch = evaluate(events, pi, 3.5, q, clip)
+        self._assert_est_equal(res.unclipped, direct_u)
+        self._assert_est_equal(res.clipped, direct_c)
+        self.assertEqual(res, batch)
+
+        res = evaluator.advance(4.0)
+        self.assertEqual(res.mature_indices, (0, 1, 2, 3))
+        direct_u, direct_c = self._direct_reference(
+            events, pi, 4.0, q, clip)
+        batch = evaluate(events, pi, 4.0, q, clip)
+        self._assert_est_equal(res.unclipped, direct_u)
+        self._assert_est_equal(res.clipped, direct_c)
+        self.assertEqual(res, batch)
+
+    def test_same_observation_time_is_atomic_and_repeated_advance_idempotent(self):
+        events = [
+            LogEvent("x", 0, 1.0, 0.5, 0.0, 2.0, "a"),
+            LogEvent("x", 1, 2.0, 0.5, 1.0, 2.0, "b"),
+        ]
+        pi = {"x": {0: 0.5, 1: 0.5}}
+        evaluator = IncrementalEvaluation(events, pi)
+        first = evaluator.advance(2.0)
+        second = evaluator.advance(2.0)
+        self.assertEqual(first, second)
+        self.assertEqual(second.mature_indices, (0, 1))
+
+    def test_backward_cutoff_rejected(self):
+        events = [LogEvent("x", 0, 1.0, 1.0, 0.0, 1.0, "a")]
+        pi = {"x": {0: 1.0}}
+        evaluator = IncrementalEvaluation(events, pi)
+        evaluator.advance(2.0)
+        with self.assertRaises(CutoffOutOfOrderError):
+            evaluator.advance(1.9)
+
+    def test_no_mature_samples_keeps_explicit_empty_state(self):
+        events = [LogEvent("x", 0, 9.0, 1.0, 0.0, 2.0, "a")]
+        pi = {"x": {0: 1.0}}
+        evaluator = IncrementalEvaluation(events, pi)
+        with self.assertRaises(NoMatureSamplesError):
+            evaluator.advance(1.0)
+        self.assertEqual(evaluator.cutoff, 1.0)
+        self.assertEqual(evaluator.mature_indices, ())
+        with self.assertRaises(CutoffOutOfOrderError):
+            evaluator.advance(0.5)
+        with self.assertRaises(NoMatureSamplesError):
+            evaluator.result()
+        res = evaluator.advance(2.0)
+        self.assertEqual(res.n_mature, 1)
+
+    def test_target_zero_probability_keeps_snips_undefined(self):
+        events = [
+            LogEvent("x", 1, 5.0, 0.0, 0.0, 1.0, "a"),
+            LogEvent("x", 1, -4.0, 0.0, 1.0, 2.0, "b"),
+        ]
+        pi = {"x": {0: 1.0, 1: 0.0}}
+        evaluator = IncrementalEvaluation(events, pi)
+        evaluator.advance(1.0)
+        res = evaluator.advance(2.0)
+        self.assertEqual(res.unclipped.ips, 0.0)
+        self.assertIsNone(res.unclipped.snips)
+        self.assertEqual(res.unclipped.ess, 0.0)
+
+    def test_duplicate_event_id_rejected(self):
+        events = [
+            LogEvent("x", 0, 1.0, 1.0, 0.0, 1.0, "same"),
+            LogEvent("x", 0, 2.0, 1.0, 1.0, 2.0, "same"),
+        ]
+        pi = {"x": {0: 1.0}}
+        with self.assertRaises(InvalidLogError):
+            IncrementalEvaluation(events, pi)
+        with self.assertRaises(InvalidLogError):
+            evaluate(events, pi, 2.0)
+
+    def test_clip_and_policy_are_fixed_after_creation(self):
+        events = [LogEvent("x", 0, 1.0, 0.5, 0.0, 1.0, "a")]
+        pi = {"x": {0: 0.5, 1: 0.5}}
+        evaluator = IncrementalEvaluation(events, pi, clip_value=3.0)
+        pi["x"][0] = 1.0
+        res = evaluator.advance(1.0)
+        self.assertEqual(res.clip_value, 3.0)
+        self.assertAlmostEqual(res.unclipped.ips, 1.0)
 
 
 if __name__ == "__main__":
