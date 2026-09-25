@@ -37,6 +37,17 @@ q_hat 完美时校正项恒为 0，DR 即退化为确定性的 m_pi 平均。SNI
 对所用权重集合分别计算；正权重时 1 <= ESS <= n_m，全零权重时 ESS = 0。
 
 本模块只实现本题契约的有限数学子集：实数标量、有限时间、离散上下文/动作。
+
+按观察时间推进的增量接口
+-------------------------
+TimelineEvaluator 在创建时一次加载并冻结日志与目标策略（及可选的 q_hat、
+clip_value），之后用 advance(cutoff) 单调推进观察时间：只有
+observed_time <= cutoff 且此前未纳入的事件组被加入。同一 observed_time
+的记录作为整组原子纳入，绝不暴露半组状态。查询 query() 返回的
+IPS/SNIPS/DR/ESS 与在同截止时刻直接调用 evaluate 的结果完全相同（同一批
+成熟样本、同一事件顺序、同一个 _compute_estimates 与 math.fsum 求和）。
+未成熟回报从不按 0 计入；尚无任何成熟样本时查询抛 NoMatureSamplesError，
+与批量入口口径一致（分母为零不凭空给 0 估计）。
 """
 
 from __future__ import annotations
@@ -50,6 +61,7 @@ __all__ = [
     "Estimate",
     "EvaluationResult",
     "evaluate",
+    "TimelineEvaluator",
     "OPEError",
     "InvalidLogError",
     "InvalidPolicyError",
@@ -57,6 +69,8 @@ __all__ = [
     "ZeroSupportError",
     "WeightOverflowError",
     "NoMatureSamplesError",
+    "DuplicateEventIdError",
+    "CutoffRegressionError",
 ]
 
 # ---- 接口边界（题面上限；短演示不必穷举） -------------------------------
@@ -96,6 +110,14 @@ class NoMatureSamplesError(OPEError):
     """截止时刻前没有任何成熟样本（全部延迟未观测）。"""
 
 
+class DuplicateEventIdError(InvalidLogError):
+    """增量接口输入日志出现重复（或缺失/不可哈希）的 event_id。"""
+
+
+class CutoffRegressionError(OPEError):
+    """advance 的截止时刻相对已推进时刻倒退（等值重推进是幂等合法操作）。"""
+
+
 @dataclass(frozen=True)
 class LogEvent:
     """一条带延迟结算的决策日志。
@@ -114,6 +136,10 @@ class LogEvent:
         决策时刻（可比较的有限实数）。
     observed_time:
         回报可观察时刻（有限实数，且 ``observed_time >= decision_time``）。
+    event_id:
+        可选事件标识（可哈希）。批量 evaluate 忽略本字段；增量接口
+        TimelineEvaluator 要求每条事件给出唯一非 None 的 event_id，
+        重复即拒绝（防止同一决策被重复纳入累计量）。
     """
 
     context: object
@@ -122,6 +148,7 @@ class LogEvent:
     logged_propensity: float
     decision_time: float
     observed_time: float
+    event_id: object = None
 
 
 @dataclass(frozen=True)
@@ -316,6 +343,66 @@ def _compute_estimates(
     return Estimate(ips=ips, snips=snips, dr=dr, ess=ess, n=n)
 
 
+def _validate_cutoff(cutoff) -> float:
+    if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)):
+        raise InvalidLogError(
+            f"cutoff 必须是有限实数，得到 {type(cutoff).__name__}")
+    cutoff = float(cutoff)
+    if not math.isfinite(cutoff):
+        raise InvalidLogError("cutoff 拒绝 NaN/Infinity")
+    return cutoff
+
+
+def _validate_clip_value(clip_value):
+    if clip_value is None:
+        return None
+    if isinstance(clip_value, bool) or not isinstance(
+            clip_value, (int, float)):
+        raise InvalidPolicyError(
+            "clip_value 必须是正实数或 None，得到 "
+            f"{type(clip_value).__name__}")
+    clip_value = float(clip_value)
+    if not math.isfinite(clip_value) or clip_value <= 0.0:
+        raise InvalidPolicyError(
+            f"clip_value 必须是正有限实数，得到 {clip_value!r}")
+    return clip_value
+
+
+def _check_zero_support(events, target_policy) -> None:
+    # 零支持是目标策略与日志的结构性不相容，对全部事件校验（与 cutoff 无关）。
+    for i, e in enumerate(events):
+        p_log = float(e.logged_propensity)
+        p_tgt = float(target_policy[e.context][e.action])
+        if p_tgt > 0.0 and p_log == 0.0:
+            raise ZeroSupportError(
+                f"零支持拒绝（events[{i}]）：context={e.context!r}, "
+                f"action={e.action!r}，目标概率={p_tgt:g} 而记录策略概率="
+                f"{p_log:g}；重要性权重无定义")
+
+
+def _mature_weight(e, target_policy, i: int) -> float:
+    # 权重只对成熟样本计算，溢出等数值检查仅施加于被使用的权重。
+    p_log = float(e.logged_propensity)
+    p_tgt = float(target_policy[e.context][e.action])
+    if p_tgt <= 0.0:
+        return 0.0
+    w = p_tgt / p_log
+    if not math.isfinite(w) or w > MAX_WEIGHT:
+        raise WeightOverflowError(
+            f"权重溢出（events[{i}]，成熟样本）：context="
+            f"{e.context!r}, action={e.action!r}，w={p_tgt:g}/"
+            f"{p_log:g} 超过上限 {MAX_WEIGHT:g}")
+    return w
+
+
+def _event_dr_terms(e, target_policy, q_lookup):
+    # 整个概率行先取值（含覆盖与有限性校验），再 fsum，保证可定位。
+    row = target_policy[e.context]
+    qs = {a: q_lookup(e.context, a) for a in row}
+    m_pi = math.fsum(float(row[a]) * qs[a] for a in row)
+    return m_pi, qs[e.action]
+
+
 def evaluate(
     events: Sequence[LogEvent],
     target_policy: Mapping[object, Mapping[object, float]],
@@ -360,37 +447,12 @@ def evaluate(
       :class:`ZeroSupportError`（对全部事件校验，不受 cutoff 影响）；
     * 权重超过 ``MAX_WEIGHT`` -> :class:`WeightOverflowError`。
     """
-    if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)):
-        raise InvalidLogError(
-            f"cutoff 必须是有限实数，得到 {type(cutoff).__name__}")
-    cutoff = float(cutoff)
-    if not math.isfinite(cutoff):
-        raise InvalidLogError("cutoff 拒绝 NaN/Infinity")
-
-    if clip_value is not None:
-        if isinstance(clip_value, bool) or not isinstance(
-                clip_value, (int, float)):
-            raise InvalidPolicyError(
-                "clip_value 必须是正实数或 None，得到 "
-                f"{type(clip_value).__name__}")
-        clip_value = float(clip_value)
-        if not math.isfinite(clip_value) or clip_value <= 0.0:
-            raise InvalidPolicyError(
-                f"clip_value 必须是正有限实数，得到 {clip_value!r}")
+    cutoff = _validate_cutoff(cutoff)
+    clip_value = _validate_clip_value(clip_value)
 
     _validate_events(events)
     _validate_policy(target_policy, events)
-
-    # 零支持是目标策略与日志的结构性不相容，对全部事件校验（与 cutoff 无关）。
-    # 权重本身只对成熟样本计算，故溢出等数值检查仅施加于被使用的权重。
-    for i, e in enumerate(events):
-        p_log = float(e.logged_propensity)
-        p_tgt = float(target_policy[e.context][e.action])
-        if p_tgt > 0.0 and p_log == 0.0:
-            raise ZeroSupportError(
-                f"零支持拒绝（events[{i}]）：context={e.context!r}, "
-                f"action={e.action!r}，目标概率={p_tgt:g} 而记录策略概率="
-                f"{p_log:g}；重要性权重无定义")
+    _check_zero_support(events, target_policy)
 
     # 成熟口径：observed_time <= cutoff。
     mature_idx = tuple(
@@ -404,19 +466,8 @@ def evaluate(
     weights: list[float] = []
     for i in mature_idx:
         e = events[i]
-        p_log = float(e.logged_propensity)
-        p_tgt = float(target_policy[e.context][e.action])
-        if p_tgt <= 0.0:
-            w = 0.0
-        else:
-            w = p_tgt / p_log
-            if not math.isfinite(w) or w > MAX_WEIGHT:
-                raise WeightOverflowError(
-                    f"权重溢出（events[{i}]，成熟样本）：context="
-                    f"{e.context!r}, action={e.action!r}，w={p_tgt:g}/"
-                    f"{p_log:g} 超过上限 {MAX_WEIGHT:g}")
+        weights.append(_mature_weight(e, target_policy, i))
         rewards.append(float(e.reward))
-        weights.append(w)
     m_pi: list[float] | None = None
     q_logged: list[float] | None = None
     if q_hat is not None:
@@ -427,12 +478,9 @@ def evaluate(
         m_pi = []
         q_logged = []
         for i in mature_idx:
-            e = events[i]
-            row = target_policy[e.context]
-            # 整个成熟行先取值（含覆盖与有限性校验），再 fsum，保证可定位。
-            qs = {a: q_lookup(e.context, a) for a in row}
-            m_pi.append(math.fsum(float(row[a]) * qs[a] for a in row))
-            q_logged.append(qs[e.action])
+            m, q = _event_dr_terms(events[i], target_policy, q_lookup)
+            m_pi.append(m)
+            q_logged.append(q)
 
     unclipped = _compute_estimates(rewards, weights, m_pi, q_logged)
 
@@ -452,3 +500,175 @@ def evaluate(
         clip_value=clip_value,
         q_hat_used=q_hat is not None,
     )
+
+
+class TimelineEvaluator:
+    """按观察时间推进的增量 OPE：一次加载冻结，随 cutoff 单调纳入成熟样本。
+
+    与批量 evaluate 的关系
+    ----------------------
+    创建时完成与 cutoff 无关的全部校验（日志结构、策略表、零支持、clip 配
+    置、event_id 唯一性），并冻结输入快照；之后 advance 单调推进观察时间，
+    query 返回的 IPS/SNIPS/DR/ESS 与在同一截止时刻直接调用批量 evaluate 的
+    结果完全相同（同一成熟样本集、同一原始事件顺序、同一 _compute_estimates
+    与 math.fsum 稳定求和）。
+
+    契约
+    ----
+    * 每条事件必须携带唯一非 None 的可哈希 event_id，重复/缺失/不可哈希
+      即在创建时抛 DuplicateEventIdError。
+    * 同一 observed_time 的记录作为整组原子纳入；任何中间状态都不会暴露
+      半组结果（组内全部贡献先计算完毕才提交，组内出错则整批不生效）。
+    * advance(cutoff) 只允许单调不减：倒退抛 CutoffRegressionError；以相同
+      cutoff 重复推进是幂等空操作。
+    * 未成熟回报从不按 0 计入；尚无任何成熟样本时 query 抛
+      NoMatureSamplesError（与批量入口同口径，分母为零不凭空给 0）。
+    * 权重截断配置 clip_value 在创建时固定，之后不可更改。
+    * 权重溢出（WeightOverflowError）与 q_hat 取值错误（InvalidQHatError）
+      与批量入口一样只在样本真正成熟时被触发，即在包含该样本的 advance 调
+      用中抛出，且该次 advance 不产生任何部分变更。
+
+    不同截止时刻的查询对应不同的估计对象口径：cutoff=T 的查询是对“T 之前
+    已成熟子日志”这一有限总体的策略价值估计，样本组成随 T 改变，估计值随
+    之改变是口径使然，不是实现不稳定。
+    """
+
+    def __init__(
+        self,
+        events: Sequence[LogEvent],
+        target_policy: Mapping[object, Mapping[object, float]],
+        q_hat: Mapping | None = None,
+        clip_value: float | None = None,
+    ) -> None:
+        clip_value = _validate_clip_value(clip_value)
+        _validate_events(events)
+        _validate_policy(target_policy, events)
+        _check_zero_support(events, target_policy)
+        if q_hat is not None and not isinstance(q_hat, Mapping):
+            raise InvalidQHatError(
+                "q_hat 必须是 Mapping（(ctx,action)->v 或 ctx->(action->v)）")
+
+        # 冻结快照：之后的推进与查询不依赖调用方持有的可变容器。
+        self._events: tuple[LogEvent, ...] = tuple(events)
+        self._policy = {ctx: dict(row) for ctx, row in target_policy.items()}
+        self._q_hat = dict(q_hat) if q_hat is not None else None
+        self._q_lookup = _make_q_lookup(self._q_hat) if q_hat is not None else None
+        self._clip_value = clip_value
+
+        seen: set = set()
+        for i, e in enumerate(self._events):
+            eid = e.event_id
+            if eid is None:
+                raise DuplicateEventIdError(
+                    f"events[{i}] 缺少 event_id（增量接口要求唯一非 None 标识）")
+            try:
+                hash(eid)
+            except TypeError as exc:
+                raise DuplicateEventIdError(
+                    f"events[{i}].event_id 必须可哈希，得到 "
+                    f"{type(eid).__name__}") from exc
+            if eid in seen:
+                raise DuplicateEventIdError(
+                    f"重复 event_id（events[{i}]）：{eid!r}；同一决策不允许"
+                    "被重复纳入累计量")
+            seen.add(eid)
+
+        # 按 observed_time 分组（同刻同组），组序列升序，推进指针单调右移。
+        groups: dict[float, list[int]] = {}
+        for i, e in enumerate(self._events):
+            groups.setdefault(float(e.observed_time), []).append(i)
+        self._groups: list[tuple[float, tuple[int, ...]]] = sorted(
+            ((t, tuple(idx)) for t, idx in groups.items()),
+            key=lambda g: g[0])
+        self._next_group = 0
+        self._cutoff: float | None = None
+        # 已成熟事件的贡献，按原始事件下标升序保持（与批量入口的求和顺序一致，
+        # 保证 fsum 结果逐位相同）。条目：(index, w, r, m_pi, q_logged)。
+        self._entries: list[tuple[int, float, float, float, float]] = []
+
+    @property
+    def cutoff(self) -> float | None:
+        """当前已推进到的截止时刻；尚未 advance 时为 None。"""
+        return self._cutoff
+
+    @property
+    def n_mature(self) -> int:
+        return len(self._entries)
+
+    def advance(self, cutoff: float) -> None:
+        """推进观察时间到 cutoff，整组纳入新成熟样本（幂等、拒绝倒退）。
+
+        失败（权重溢出、q_hat 取值非法等）时不留下任何部分变更：所有新组成
+        熟的贡献先完整计算，全部成功后才一次性提交。
+        """
+        cutoff = _validate_cutoff(cutoff)
+        if self._cutoff is not None:
+            if cutoff < self._cutoff:
+                raise CutoffRegressionError(
+                    f"cutoff 倒退拒绝：当前已推进到 {self._cutoff:g}，"
+                    f"收到 {cutoff:g}；观察时间只能单调不减")
+            if cutoff == self._cutoff:
+                return  # 等值重推进：幂等空操作
+
+        new_entries: list[tuple[int, float, float, float, float]] = []
+        next_group = self._next_group
+        while (next_group < len(self._groups)
+               and self._groups[next_group][0] <= cutoff):
+            for i in self._groups[next_group][1]:
+                e = self._events[i]
+                w = _mature_weight(e, self._policy, i)
+                if self._q_lookup is not None:
+                    m, q = _event_dr_terms(e, self._policy, self._q_lookup)
+                else:
+                    m, q = 0.0, 0.0
+                new_entries.append((i, w, float(e.reward), m, q))
+            next_group += 1
+
+        # 全部新组计算成功后才提交：按原始下标归并保持求和顺序。
+        new_entries.sort(key=lambda t: t[0])
+        merged: list[tuple[int, float, float, float, float]] = []
+        it_old, it_new = iter(self._entries), iter(new_entries)
+        old = next(it_old, None)
+        new = next(it_new, None)
+        while old is not None or new is not None:
+            if new is None or (old is not None and old[0] < new[0]):
+                merged.append(old)
+                old = next(it_old, None)
+            else:
+                merged.append(new)
+                new = next(it_new, None)
+        self._entries = merged
+        self._next_group = next_group
+        self._cutoff = cutoff
+
+    def query(self) -> EvaluationResult:
+        """返回当前截止时刻的评估结果，与同 cutoff 的批量 evaluate 完全相同。"""
+        if not self._entries:
+            where = (f"cutoff={self._cutoff:g}" if self._cutoff is not None
+                     else "尚未 advance")
+            raise NoMatureSamplesError(
+                f"{where} 前无成熟样本：{len(self._events)} 条事件的回报"
+                "均尚未观察到；未成熟事件不按 reward=0 计入")
+        weights = [t[1] for t in self._entries]
+        rewards = [t[2] for t in self._entries]
+        if self._q_lookup is not None:
+            m_pi = [t[3] for t in self._entries]
+            q_logged = [t[4] for t in self._entries]
+        else:
+            m_pi = q_logged = None
+        unclipped = _compute_estimates(rewards, weights, m_pi, q_logged)
+        clipped_est: Estimate | None = None
+        if self._clip_value is not None:
+            cw = [min(w, self._clip_value) for w in weights]
+            clipped_est = _compute_estimates(rewards, cw, m_pi, q_logged)
+        return EvaluationResult(
+            cutoff=self._cutoff,
+            n_total=len(self._events),
+            n_mature=len(self._entries),
+            n_immature=len(self._events) - len(self._entries),
+            mature_indices=tuple(t[0] for t in self._entries),
+            unclipped=unclipped,
+            clipped=clipped_est,
+            clip_value=self._clip_value,
+            q_hat_used=self._q_lookup is not None,
+        )

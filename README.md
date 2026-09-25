@@ -12,8 +12,9 @@
 ## 运行命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（23 个测试方法，其中枚举含 369 个恒等用例）
+python -m unittest discover -s tests -v   # 必要测试（42 个测试方法，枚举含 369 个恒等用例）
 python demo.py                            # 约 0.1 秒完成的固定输入演示（上限约 8 秒）
+python demo_timeline.py                   # 增量接口演示：估计随 cutoff 推进变化（约 0.1 秒）
 ```
 
 在仓库根目录执行。`tests/independent_reference.py` 是**独立参考**：它不导入
@@ -24,10 +25,12 @@ python demo.py                            # 约 0.1 秒完成的固定输入演�
 
 ```
 delayed_ope/__init__.py   公开接口
-delayed_ope/core.py       核心算法与全部校验
+delayed_ope/core.py       核心算法与全部校验（批量 evaluate + 增量 TimelineEvaluator）
 tests/independent_reference.py  独立分布参考（不依赖被测核心）
 tests/test_ope.py         必要测试
+tests/test_timeline.py    增量接口测试（与批量入口逐位核对 + 手算参照）
 demo.py                   固定种子数据生成 + 正常结果 + 两个真实触发的拒绝边界
+demo_timeline.py          增量推进演示 + 倒退/重复 ID 两个真实触发的拒绝边界
 ```
 
 ## 数据结构与接口
@@ -57,6 +60,7 @@ result = evaluate(
 | `logged_propensity` | 记录策略概率 μ(a\|x) | 有限实数，[0,1] |
 | `decision_time` | 决策时刻 t_d | 有限实数 |
 | `observed_time` | 回报可观察时刻 t_o | 有限实数，t_o ≥ t_d |
+| `event_id` | 事件标识（可选，默认 None） | 可哈希；批量入口忽略，增量接口要求唯一非 None |
 
 `evaluate` 返回 `EvaluationResult`（不可变 dataclass）：
 
@@ -112,7 +116,6 @@ DR 退化为已实现 context 序列上 m_π 的平均值，不再有权重噪�
 ## 错误语义（非法输入不静默纠正，错误可定位）
 
 所有错误继承 `OPEError`；消息带字段名/`events[i]` 位置：
-
 | 异常 | 触发 |
 |---|---|
 | `InvalidLogError` | 数值 NaN/Infinity；`cutoff`/reward/时间非有限实数；propensity ∉ [0,1]；t_o<t_d；context/action 不可哈希；事件数超上限；容器或元素类型错 |
@@ -121,12 +124,53 @@ DR 退化为已实现 context 序列上 m_π 的平均值，不再有权重噪�
 | `ZeroSupportError` | π>0 而 logged_propensity==0 |
 | `WeightOverflowError` | 成熟样本权重 > 1e300 |
 | `NoMatureSamplesError` | cutoff 前无成熟样本 |
+| `DuplicateEventIdError` | 增量接口：event_id 缺失/不可哈希/重复（InvalidLogError 子类） |
+| `CutoffRegressionError` | 增量接口：advance 的 cutoff 相对已推进时刻倒退 |
 
 - 所有**数值参数**（含 `cutoff`、`clip_value`、概率、reward、时间、q 值）
   拒绝 `NaN` 与正负 `Infinity`；**整数/数值位置拒绝 `bool`**（`True/False`
   不是合法数字参数）。
 - `evaluate` 为纯函数、无副作用；校验在构造任何结果前完成，不存在部分变更。
   不会修改传入的策略表/事件（有测试覆盖）。
+
+## 按观察时间推进的增量接口（TimelineEvaluator）
+
+`TimelineEvaluator` 在**创建时一次加载并冻结**日志与目标策略（及可选 q_hat、
+clip_value 的快照），之后用 `advance(cutoff)` 单调推进观察时间、`query()`
+查询当前结果。它不是批量入口的平行实现：构造复用同一套校验，查询复用同一个
+`_compute_estimates` 与 `math.fsum` 稳定求和，且已成熟事件按原始下标顺序
+保持 —— 因此**任一截止时刻的 IPS/SNIPS/DR/ESS 与在该截止时刻直接调用
+`evaluate` 的结果完全相同**（测试逐位核对，含 clipped 组与 mature_indices）。
+
+```python
+from delayed_ope import TimelineEvaluator
+
+tl = TimelineEvaluator(events, target_policy, q_hat=q, clip_value=2.0)
+tl.advance(5.0)          # 整组纳入 observed_time <= 5.0 的新成熟样本
+res = tl.query()         # == evaluate(events, target_policy, 5.0, q_hat=q, clip_value=2.0)
+tl.advance(9.0)          # 只纳入 (5.0, 9.0] 内新成熟的组
+```
+
+契约要点：
+
+- **同刻整组原子纳入**：同一 `observed_time` 的记录作为一组，要么全组进入
+  要么不进入，任何时刻都不暴露半组结果；组内任一事件出错（如权重溢出、
+  q_hat 缺值）则该次 `advance` 整体失败且不留部分变更。
+- **单调不减**：`advance` 的 cutoff 小于已推进时刻抛
+  `CutoffRegressionError`；以相同 cutoff 重复推进是幂等空操作。
+- **重复 ID 拒绝**：每条事件必须携带唯一非 None 的可哈希 `event_id`，
+  重复/缺失/不可哈希在创建时抛 `DuplicateEventIdError`（InvalidLogError
+  子类），防止同一决策被重复纳入累计量。
+- **未成熟绝不当 0**：尚无任何成熟样本时 `query()` 抛
+  `NoMatureSamplesError`（与批量入口同口径）；SNIPS 分母为零仍返回
+  `None`、ESS 为 0，沿用显式状态而非凭空给 0 估计。
+- **截断配置创建后固定**：`clip_value` 只在构造时给定，之后不可更改。
+- **错误时机**：与 cutoff 无关的校验（日志结构、策略表、零支持、ID 唯一）
+  在创建时完成；权重溢出与 q_hat 取值错误与批量入口一样只在样本真正成熟
+  时（即包含该样本的 `advance` 中）触发。
+- **口径说明**：cutoff=T 的查询是对“T 之前已成熟子日志”这一有限总体的
+  策略价值估计；不同截止时刻对应不同估计对象，估计值随样本成熟而改变是
+  口径定义使然，不是实现不稳定。
 
 ## 输入上限（接口边界，非性能承诺）
 
@@ -175,5 +219,7 @@ DR 退化为已实现 context 序列上 m_π 的平均值，不再有权重噪�
   完整映射。
 - 不处理同一决策的多值/序列回报、回报删失（censoring）与观察过程的选择性
   偏差；前提是“到期即可观察”的无信息删失。
-- 无流式/增量接口；一次调用处理一个批次（上限 1e6 事件，内存 O(事件数)）。
+- 批量 `evaluate` 一次调用处理一个批次；增量 `TimelineEvaluator` 为单
+  调推进的有状态对象（事件上限同为 1e6，内存 O(事件数)），不提供回滚、
+  分支时间线或多步轨迹/在线服务能力。
 - q_hat 两种键形式（扁平 tuple 键 / 嵌套映射）同时给出时以扁平键为准。
