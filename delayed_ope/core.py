@@ -41,6 +41,7 @@ q_hat 完美时校正项恒为 0，DR 即退化为确定性的 m_pi 平均。SNI
 
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass
 from typing import Mapping, Sequence
@@ -57,6 +58,12 @@ __all__ = [
     "ZeroSupportError",
     "WeightOverflowError",
     "NoMatureSamplesError",
+    "RobustObservation",
+    "RobustConstraintCheck",
+    "RobustIPSResult",
+    "robust_ips_range",
+    "InvalidIntervalError",
+    "InfeasibleIntervalError",
 ]
 
 # ---- 接口边界（题面上限；短演示不必穷举） -------------------------------
@@ -94,6 +101,14 @@ class WeightOverflowError(OPEError):
 
 class NoMatureSamplesError(OPEError):
     """截止时刻前没有任何成熟样本（全部延迟未观测）。"""
+
+
+class InfeasibleIntervalError(OPEError):
+    """行为概率闭区间不存在和为 1 的联合可行概率表。"""
+
+
+class InvalidIntervalError(OPEError):
+    """行为概率区间结构或数值非法。"""
 
 
 @dataclass(frozen=True)
@@ -171,6 +186,50 @@ class EvaluationResult:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class RobustObservation:
+    """一条已观察动作及实得回报（稳健 IPS 范围入口）。"""
+
+    context: object
+    action: object
+    reward: float
+
+
+@dataclass(frozen=True)
+class RobustConstraintCheck:
+    """单个 context 的行为概率区间可行性检查。"""
+
+    context: object
+    actions: tuple[object, ...]
+    lower_probabilities: tuple[float, ...]
+    upper_probabilities: tuple[float, ...]
+    lower_sum: float
+    upper_sum: float
+    feasible: bool
+
+
+@dataclass(frozen=True)
+class RobustIPSResult:
+    """共享行为概率变量下的稳健 IPS 最小/最大值。"""
+
+    n: int
+    minimum: float
+    maximum: float
+    min_probabilities: Mapping[object, Mapping[object, float]]
+    max_probabilities: Mapping[object, Mapping[object, float]]
+    constraint_checks: tuple[RobustConstraintCheck, ...]
+
+    def summary(self) -> str:
+        lines = [
+            f"robust IPS range over n={self.n} observations",
+            f"minimum={self.minimum:.12g}",
+            f"maximum={self.maximum:.12g}",
+            "all context interval rows satisfy sum(lower) <= 1 <= "
+            "sum(upper)",
+        ]
+        return "\n".join(lines)
+
+
 def _fmt_est(tag: str, est: Estimate) -> str:
     sn = "undefined" if est.snips is None else f"{est.snips:.12g}"
     dr = "n/a" if est.dr is None else f"{est.dr:.12g}"
@@ -178,6 +237,154 @@ def _fmt_est(tag: str, est: Estimate) -> str:
         f"[{tag}] IPS={est.ips:.12g}, SNIPS={sn}, DR={dr}, "
         f"ESS={est.ess:.6g}/{est.n}"
     )
+
+
+ROBUST_CONSTRAINT_TOL = 1e-10
+
+
+def _validate_robust_observations(
+    observations: Sequence[RobustObservation],
+) -> None:
+    if not isinstance(observations, Sequence):
+        raise InvalidLogError(
+            "observations 必须是 RobustObservation 的序列（Sequence）")
+    if len(observations) > MAX_EVENTS:
+        raise InvalidLogError(
+            f"观测数 {len(observations)} 超过接口上限 {MAX_EVENTS}")
+    if not observations:
+        raise InvalidLogError("robust IPS 至少需要一条已观察记录")
+    for i, obs in enumerate(observations):
+        if not isinstance(obs, RobustObservation):
+            raise InvalidLogError(
+                f"observations[{i}] 必须是 RobustObservation，得到 "
+                f"{type(obs).__name__}")
+        _finite_float(obs.reward, f"observations[{i}].reward")
+        try:
+            hash(obs.context)
+            hash(obs.action)
+        except TypeError as exc:
+            raise InvalidLogError(
+                f"observations[{i}]: context/action 必须可哈希") from exc
+
+
+def _validate_robust_target(
+    observations: Sequence[RobustObservation],
+    target_policy: Mapping[object, Mapping[object, float]],
+) -> None:
+    if not isinstance(target_policy, Mapping):
+        raise InvalidPolicyError(
+            "target_policy 必须是 Mapping[context, Mapping[action, prob]]")
+    contexts = {obs.context for obs in observations}
+    logged_pairs = {(obs.context, obs.action) for obs in observations}
+    for ctx in contexts:
+        if ctx not in target_policy:
+            raise InvalidPolicyError(
+                f"target_policy 缺少 context {ctx!r} 的动作概率行")
+        row = target_policy[ctx]
+        if not isinstance(row, Mapping) or len(row) == 0:
+            raise InvalidPolicyError(
+                f"target_policy[{ctx!r}] 必须是非空 action->prob Mapping")
+        if len(row) > 3:
+            raise InvalidPolicyError(
+                f"稳健 IPS 范围入口限制 context {ctx!r} 至多 3 个动作，"
+                f"得到 {len(row)} 个")
+        total = 0.0
+        for action, prob in row.items():
+            total += _finite_prob(
+                prob,
+                f"target_policy[{ctx!r}][{action!r}]",
+                InvalidPolicyError,
+            )
+        if abs(total - 1.0) > PROB_SUM_TOL:
+            raise InvalidPolicyError(
+                f"context {ctx!r} 的目标概率之和={total!r}，与 1.0 的偏差"
+                f"超过容差 {PROB_SUM_TOL:g}")
+    for ctx, action in logged_pairs:
+        if action not in target_policy[ctx]:
+            raise InvalidPolicyError(
+                f"target_policy[{ctx!r}] 缺少观察动作 {action!r}")
+
+
+def _interval_bounds(value, ctx: object, action: object) -> tuple[float, float]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise InvalidIntervalError(
+            f"propensity_intervals[{ctx!r}][{action!r}] 必须是 "
+            "(lower, upper) 序列")
+    if len(value) != 2:
+        raise InvalidIntervalError(
+            f"propensity_intervals[{ctx!r}][{action!r}] 必须恰好含 "
+            f"(lower, upper)，得到长度 {len(value)}")
+    lower = _finite_prob(
+        value[0],
+        f"propensity_intervals[{ctx!r}][{action!r}].lower",
+        InvalidIntervalError,
+    )
+    upper = _finite_prob(
+        value[1],
+        f"propensity_intervals[{ctx!r}][{action!r}].upper",
+        InvalidIntervalError,
+    )
+    if lower <= 0.0:
+        raise InvalidIntervalError(
+            f"propensity_intervals[{ctx!r}][{action!r}].lower 必须严格为正，"
+            f"得到 {lower:g}")
+    if lower > upper:
+        raise InfeasibleIntervalError(
+            f"context {ctx!r}, action {action!r} 的区间上下界颠倒："
+            f"[{lower:g}, {upper:g}]")
+    return lower, upper
+
+
+def _validate_robust_intervals(
+    observations: Sequence[RobustObservation],
+    target_policy: Mapping[object, Mapping[object, float]],
+    propensity_intervals: Mapping[object, Mapping[object, Sequence[float]]],
+):
+    if not isinstance(propensity_intervals, Mapping):
+        raise InvalidIntervalError(
+            "propensity_intervals 必须是 Mapping[context, Mapping[action, "
+            "(lower, upper)]]")
+    contexts = {obs.context for obs in observations}
+    rows = {}
+    checks = []
+    for ctx in contexts:
+        if ctx not in propensity_intervals:
+            raise InvalidIntervalError(
+                f"propensity_intervals 缺少 context {ctx!r} 的概率区间行")
+        interval_row = propensity_intervals[ctx]
+        target_row = target_policy[ctx]
+        if not isinstance(interval_row, Mapping):
+            raise InvalidIntervalError(
+                f"propensity_intervals[{ctx!r}] 必须是 action->interval Mapping")
+        if set(interval_row) != set(target_row):
+            raise InvalidIntervalError(
+                f"context {ctx!r} 的区间动作集合必须与目标策略完全一致")
+        parsed = tuple(
+            (action, *_interval_bounds(interval_row[action], ctx, action))
+            for action in target_row
+        )
+        lowers = tuple(item[1] for item in parsed)
+        uppers = tuple(item[2] for item in parsed)
+        lower_sum = math.fsum(lowers)
+        upper_sum = math.fsum(uppers)
+        feasible = lower_sum <= 1.0 + ROBUST_CONSTRAINT_TOL and (
+            upper_sum >= 1.0 - ROBUST_CONSTRAINT_TOL)
+        checks.append(RobustConstraintCheck(
+            context=ctx,
+            actions=tuple(item[0] for item in parsed),
+            lower_probabilities=lowers,
+            upper_probabilities=uppers,
+            lower_sum=lower_sum,
+            upper_sum=upper_sum,
+            feasible=feasible,
+        ))
+        if not feasible:
+            raise InfeasibleIntervalError(
+                f"context {ctx!r} 的行为概率区间不可满足：sum(lower)="
+                f"{lower_sum:g}, sum(upper)={upper_sum:g}；闭区间盒与"
+                "概率单纯形无交集")
+        rows[ctx] = parsed
+    return rows, tuple(checks)
 
 
 def _finite_float(x, what: str) -> float:
@@ -451,4 +658,166 @@ def evaluate(
         clipped=clipped_est,
         clip_value=clip_value,
         q_hat_used=q_hat is not None,
+    )
+
+
+def _box_simplex_feasible_point(parsed):
+    probs = [lower for _, lower, _ in parsed]
+    residual = 1.0 - math.fsum(probs)
+    if residual < -ROBUST_CONSTRAINT_TOL:
+        raise InfeasibleIntervalError("内部可行性检查失败：下界和大于 1")
+    for j, (_, lower, upper) in enumerate(parsed):
+        add = min(max(residual, 0.0), upper - lower)
+        probs[j] += add
+        residual -= add
+    if abs(residual) > ROBUST_CONSTRAINT_TOL:
+        raise InfeasibleIntervalError("内部可行性检查失败：上界和小于 1")
+    return probs
+
+
+def _context_objective(coefficients, probs):
+    return math.fsum(c / p for c, p in zip(coefficients, probs))
+
+
+def _valid_probability_vector(probs, parsed):
+    for p, (_, lower, upper) in zip(probs, parsed):
+        if p < lower - 1e-11 or p > upper + 1e-11 or p <= 0.0:
+            return False
+    return abs(math.fsum(probs) - 1.0) <= ROBUST_CONSTRAINT_TOL
+
+
+def _optimize_context_objective(parsed, coefficients, find_minimum):
+    """枚举至多 3 个动作的 KKT active set，避免通用非线性求解器。"""
+    m = len(parsed)
+    candidates = [_box_simplex_feasible_point(parsed)]
+
+    for statuses in itertools.product(("lower", "upper", "free"), repeat=m):
+        probs = [0.0] * m
+        free = []
+        fixed_sum = 0.0
+        free_lower_sum = 0.0
+        free_upper_sum = 0.0
+        for j, status in enumerate(statuses):
+            _, lower, upper = parsed[j]
+            if status == "lower":
+                probs[j] = lower
+                fixed_sum += lower
+            elif status == "upper":
+                probs[j] = upper
+                fixed_sum += upper
+            else:
+                free.append(j)
+                free_lower_sum += lower
+                free_upper_sum += upper
+        free_mass = 1.0 - fixed_sum
+        if free_mass < free_lower_sum - ROBUST_CONSTRAINT_TOL:
+            continue
+        if free_mass > free_upper_sum + ROBUST_CONSTRAINT_TOL:
+            continue
+        if not free:
+            if abs(free_mass) <= ROBUST_CONSTRAINT_TOL:
+                candidates.append(probs.copy())
+            continue
+        if len(free) == 1:
+            probs[free[0]] = free_mass
+            candidates.append(probs.copy())
+            continue
+
+        free_coeffs = [coefficients[j] for j in free]
+        if all(c > 0.0 for c in free_coeffs):
+            scale = math.fsum(math.sqrt(c) for c in free_coeffs)
+            for j, c in zip(free, free_coeffs):
+                probs[j] = free_mass * math.sqrt(c) / scale
+            candidates.append(probs.copy())
+        elif all(c < 0.0 for c in free_coeffs):
+            scale = math.fsum(math.sqrt(-c) for c in free_coeffs)
+            for j, c in zip(free, free_coeffs):
+                probs[j] = free_mass * math.sqrt(-c) / scale
+            candidates.append(probs.copy())
+
+    feasible = [p for p in candidates if _valid_probability_vector(p, parsed)]
+    if not feasible:
+        raise InfeasibleIntervalError("内部候选点检查失败：未找到可行概率")
+    scored = [(_context_objective(coefficients, p), p) for p in feasible]
+    value, best = (min if find_minimum else max)(
+        scored, key=lambda item: item[0])
+    if not math.isfinite(value):
+        raise WeightOverflowError(
+            "稳健 IPS 目标值出现非有限结果；拒绝返回 inf/NaN")
+    return best
+
+
+def _probability_table(ctx, parsed, probs):
+    return {ctx: {item[0]: p for item, p in zip(parsed, probs)}}
+
+
+def robust_ips_range(
+    observations: Sequence[RobustObservation],
+    target_policy: Mapping[object, Mapping[object, float]],
+    propensity_intervals: Mapping[object, Mapping[object, Sequence[float]]],
+) -> RobustIPSResult:
+    """计算行为概率只以正闭区间给定时的未截断 IPS 最小/最大值。
+
+    每个 context 的所有动作共享一个概率向量，必须同时位于各自闭区间且和为
+    1。不同 context 的概率变量相互独立；IPS 对 context 可加，因此分别最小化/
+    最大化后合并。结果中的两张概率表是真正达到边界的表，而不是逐记录挑选的
+    概率。
+    """
+    _validate_robust_observations(observations)
+    _validate_robust_target(observations, target_policy)
+    rows, checks = _validate_robust_intervals(
+        observations, target_policy, propensity_intervals)
+
+    context_actions = {
+        ctx: tuple(item[0] for item in parsed)
+        for ctx, parsed in rows.items()
+    }
+    coefficients = {
+        ctx: [0.0] * len(actions)
+        for ctx, actions in context_actions.items()
+    }
+    action_index = {
+        ctx: {action: j for j, action in enumerate(actions)}
+        for ctx, actions in context_actions.items()
+    }
+    for obs in observations:
+        ctx = obs.context
+        action = obs.action
+        target_prob = float(target_policy[ctx][action])
+        j = action_index[ctx][action]
+        coefficients[ctx][j] += target_prob * float(obs.reward)
+
+    min_table = {}
+    max_table = {}
+    minimum_sum = 0.0
+    maximum_sum = 0.0
+    for ctx, parsed in rows.items():
+        coeffs = coefficients[ctx]
+        min_probs = _optimize_context_objective(parsed, coeffs, True)
+        max_probs = _optimize_context_objective(parsed, coeffs, False)
+        min_table[ctx] = {
+            item[0]: p for item, p in zip(parsed, min_probs)}
+        max_table[ctx] = {
+            item[0]: p for item, p in zip(parsed, max_probs)}
+        minimum_sum += _context_objective(coeffs, min_probs)
+        maximum_sum += _context_objective(coeffs, max_probs)
+
+        for probs, table_name in ((min_probs, "minimum"), (max_probs, "maximum")):
+            for j, item in enumerate(parsed):
+                action, _, _ = item
+                weight = float(target_policy[ctx][action]) / probs[j]
+                if not math.isfinite(weight) or weight > MAX_WEIGHT:
+                    raise WeightOverflowError(
+                        f"context {ctx!r} 的 {table_name} 边界权重 "
+                        f"{weight:g} 超过上限 {MAX_WEIGHT:g}；本接口不自动"
+                        "裁剪权重")
+
+    n = len(observations)
+    return RobustIPSResult(
+        n=n,
+        minimum=minimum_sum / n,
+        maximum=maximum_sum / n,
+        min_probabilities=min_table,
+        max_probabilities=max_table,
+        constraint_checks=checks,
     )

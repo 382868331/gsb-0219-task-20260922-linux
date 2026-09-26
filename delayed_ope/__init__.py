@@ -16,6 +16,12 @@ from .core import (
     WeightOverflowError,
     ZeroSupportError,
     evaluate,
+    InfeasibleIntervalError,
+    InvalidIntervalError,
+    RobustConstraintCheck,
+    RobustIPSResult,
+    RobustObservation,
+    robust_ips_range,
 )
 
 __all__ = [
@@ -30,4 +36,10 @@ __all__ = [
     "WeightOverflowError",
     "NoMatureSamplesError",
     "evaluate",
+    "RobustObservation",
+    "RobustConstraintCheck",
+    "RobustIPSResult",
+    "robust_ips_range",
+    "InvalidIntervalError",
+    "InfeasibleIntervalError",
 ]
