@@ -14,14 +14,17 @@ import random
 import unittest
 
 from delayed_ope import (
+    InfeasibleProbabilityIntervalsError,
     InvalidLogError,
     InvalidPolicyError,
     InvalidQHatError,
     LogEvent,
     NoMatureSamplesError,
+    RobustLogEvent,
     WeightOverflowError,
     ZeroSupportError,
     evaluate,
+    robust_ips,
 )
 from delayed_ope.core import MAX_EVENTS, MAX_WEIGHT, PROB_SUM_TOL
 
@@ -30,6 +33,7 @@ from independent_reference import (
     CENSUS_PER_CONTEXT,
     CONTEXTS,
     policy_value,
+    two_action_interval_extrema,
 )
 
 
@@ -357,6 +361,147 @@ class DRFormulaTests(unittest.TestCase):
         r1 = evaluate(events, pi, 2.0, q_hat=flat)
         r2 = evaluate(events, pi, 2.0, q_hat=nested)
         self.assertEqual(r1.unclipped.dr, r2.unclipped.dr)
+
+
+class RobustIPSTests(unittest.TestCase):
+    def test_two_action_independent_boundaries_and_stationary_points(self):
+        intervals_list = [
+            ((0.2, 0.8), (0.2, 0.8)),
+            ((0.1, 0.35), (0.4, 0.9)),
+            ((0.05, 0.7), (0.3, 0.95)),
+        ]
+        coefficients = [
+            (1.0, 2.0),
+            (3.0, -2.0),
+            (-4.0, -1.0),
+            (-0.5, 2.5),
+            (0.0, 2.0),
+        ]
+        for (l0, h0), (l1, h1) in intervals_list:
+            if l0 + l1 > 1.0 or h0 + h1 < 1.0:
+                continue
+            for c0, c1 in coefficients:
+                with self.subTest(c=(c0, c1), i=((l0, h0), (l1, h1))):
+                    pi = {"x": {0: 0.5, 1: 0.5}}
+                    iv = {"x": {0: (l0, h0), 1: (l1, h1)}}
+                    events = [
+                        RobustLogEvent("x", 0, 2.0 * c0),
+                        RobustLogEvent("x", 1, 2.0 * c1),
+                    ]
+                    res = robust_ips(events, pi, iv, cutoff=2.0)
+                    raw_min, raw_max, p_min, p_max = two_action_interval_extrema(
+                        c0, c1, l0, h0, l1, h1)
+                    self.assertAlmostEqual(
+                        res.minimum.ips, raw_min / 2.0, places=11)
+                    self.assertAlmostEqual(
+                        res.maximum.ips, raw_max / 2.0, places=11)
+                    self.assertAlmostEqual(
+                        res.minimum.behavior_policy["x"][0], p_min, places=11)
+                    self.assertAlmostEqual(
+                        res.maximum.behavior_policy["x"][0], p_max, places=11)
+                    for bound in (res.minimum, res.maximum):
+                        check = bound.constraint_checks[0]
+                        self.assertTrue(check.feasible_intervals)
+                        self.assertAlmostEqual(
+                            check.probability_sum, 1.0, places=11)
+                        self.assertLessEqual(check.max_interval_violation, 1e-11)
+
+    def test_three_action_positive_coefficients_interior_and_vertices(self):
+        events = [RobustLogEvent("x", a, 3.0) for a in (0, 1, 2)]
+        pi = {"x": {0: 1.0 / 3.0, 1: 1.0 / 3.0, 2: 1.0 / 3.0}}
+        iv = {"x": {0: (0.2, 0.5), 1: (0.2, 0.5), 2: (0.2, 0.5)}}
+        res = robust_ips(events, pi, iv, 2.0)
+        # c=(1,1,1)，n=3：最小值在均匀驻点，最大值在 (0.2,0.3,0.5) 型顶点。
+        self.assertAlmostEqual(res.minimum.ips, 3.0, places=11)
+        self.assertAlmostEqual(res.maximum.ips, 31.0 / 9.0, places=11)
+        for probability in res.minimum.behavior_policy["x"].values():
+            self.assertAlmostEqual(probability, 1.0 / 3.0, places=11)
+        max_row = res.maximum.behavior_policy["x"]
+        self.assertAlmostEqual(min(max_row.values()), 0.2, places=11)
+        for got, expected in zip(sorted(max_row.values()), (0.2, 0.3, 0.5)):
+            self.assertAlmostEqual(got, expected, places=11)
+
+    def test_same_action_positive_negative_feedback_cancels(self):
+        events = [
+            RobustLogEvent("x", 0, 10.0),
+            RobustLogEvent("x", 0, -10.0),
+            RobustLogEvent("x", 1, 2.0),
+        ]
+        pi = {"x": {0: 0.4, 1: 0.6}}
+        iv = {"x": {0: (0.2, 0.8), 1: (0.2, 0.8)}}
+        res = robust_ips(events, pi, iv, 2.0)
+        # action0 的加权奖励和为 0；仅 c1=1.2，f=1.2/(1-p)，n=3。
+        self.assertAlmostEqual(res.minimum.ips, 1.2 / 0.8 / 3.0, places=11)
+        self.assertAlmostEqual(res.maximum.ips, 1.2 / 0.2 / 3.0, places=11)
+
+    def test_one_probability_vector_shared_across_records(self):
+        events = [
+            RobustLogEvent("x", 0, 5.0),
+            RobustLogEvent("x", 0, -3.0),
+            RobustLogEvent("x", 1, 2.0),
+        ]
+        pi = {"x": {0: 0.5, 1: 0.5}}
+        iv = {"x": {0: (0.25, 0.75), 1: (0.25, 0.75)}}
+        res = robust_ips(events, pi, iv, 2.0)
+        # c=(1,1)，n=3；不能让两条 action0 分别使用不同概率。
+        ref_min, ref_max, _, _ = two_action_interval_extrema(
+            1.0, 1.0, 0.25, 0.75, 0.25, 0.75)
+        self.assertAlmostEqual(res.minimum.ips, ref_min / 3.0, places=11)
+        self.assertAlmostEqual(res.maximum.ips, ref_max / 3.0, places=11)
+
+    def test_infeasible_intervals_rejected_before_optimization(self):
+        events = [RobustLogEvent("x", 0, 1.0), RobustLogEvent("x", 1, -1.0)]
+        pi = {"x": {0: 0.5, 1: 0.5}}
+        bad_intervals = {
+            "x": {0: (0.7, 0.9), 1: (0.7, 0.9)},  # 下界和 1.4 > 1
+        }
+        with self.assertRaises(InfeasibleProbabilityIntervalsError):
+            robust_ips(events, pi, bad_intervals, 2.0)
+
+    def test_positive_closed_intervals_reject_zero(self):
+        events = [RobustLogEvent("x", 0, 1.0)]
+        pi = {"x": {0: 1.0}}
+        iv = {"x": {0: (0.0, 1.0)}}
+        with self.assertRaises(InvalidPolicyError):
+            robust_ips(events, pi, iv, 2.0)
+
+    def test_robust_maturity_and_no_weight_clipping(self):
+        events = [
+            RobustLogEvent("x", 0, 1.0, 0.0, 1.0),
+            RobustLogEvent("x", 1, 1.0, 0.0, 9.0),
+        ]
+        pi = {"x": {0: 0.8, 1: 0.2}}
+        iv = {"x": {0: (0.1, 0.9), 1: (0.1, 0.9)}}
+        res = robust_ips(events, pi, iv, 2.0)
+        self.assertEqual(res.mature_indices, (0,))
+        self.assertAlmostEqual(res.minimum.ips, 0.8 / 0.9, places=11)
+        self.assertAlmostEqual(res.maximum.ips, 0.8 / 0.1, places=11)
+
+    def test_more_than_three_actions_rejected(self):
+        events = [RobustLogEvent("x", 0, 1.0)]
+        pi = {"x": {0: 1.0, 1: 0.0, 2: 0.0, 3: 0.0}}
+        intervals = {
+            "x": {0: (0.4, 1.0), 1: (0.01, 0.2),
+                   2: (0.01, 0.2), 3: (0.01, 0.2)}
+        }
+        with self.assertRaises(InvalidPolicyError):
+            robust_ips(events, pi, intervals, 2.0)
+
+    def test_target_and_interval_action_sets_must_match(self):
+        events = [RobustLogEvent("x", 0, 1.0)]
+        pi = {"x": {0: 0.5, 1: 0.5}}
+        intervals = {
+            "x": {0: (0.4, 0.6), 1: (0.2, 0.4), 2: (0.2, 0.4)},
+        }
+        with self.assertRaises(InvalidPolicyError):
+            robust_ips(events, pi, intervals, 2.0)
+
+    def test_robust_overflow_is_rejected_without_clipping(self):
+        events = [RobustLogEvent("x", 0, 1.0)]
+        pi = {"x": {0: 1.0}}
+        intervals = {"x": {0: (1e-308, 1.0)}}
+        with self.assertRaises(WeightOverflowError):
+            robust_ips(events, pi, intervals, 2.0)
 
 
 class ValidationTests(unittest.TestCase):

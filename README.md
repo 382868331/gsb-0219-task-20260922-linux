@@ -3,17 +3,30 @@
 纯 Python 标准库实现的离线策略评估（OPE）模块。处理推荐/决策日志中**回报延迟
 结算**的情形：在固定评估截止时刻，只用已经观察到回报的成熟样本，计算目标策略
 的 IPS、SNIPS、Doubly Robust（DR）估计；未成熟样本**绝不按 reward=0 计入**。
+本轮在保留旧的单值倾向入口之外，新增行为概率为**正闭区间**时的稳健 IPS
+最小/最大值入口。
 
 - Python 版本：**3.14.7**（仅使用 3.10+ 通用语法，标准库；无任何第三方依赖）
 - 运行环境：Linux 原生；装好 Python 后无需安装其他依赖
 - 离线：不访问网络、账号、数据库、中间件、云 API 或 Docker
 - 核心算法未使用任何第三方 OPE 实现
 
-## 运行命令
+## 运行准备与命令
+
+Linux 原生 Python 3.14.7，仅标准库。可以使用 venv，但不需要安装第三方包：
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（23 个测试方法，其中枚举含 369 个恒等用例）
-python demo.py                            # 约 0.1 秒完成的固定输入演示（上限约 8 秒）
+python -m venv .venv
+source .venv/bin/activate
+python --version    # 期望 3.14.7；代码本身使用 3.10+ 通用语法
+```
+
+不启用 venv 时，只要系统 `python` 是兼容版本也可直接运行命令。
+
+```bash
+python -m unittest discover -s tests -v   # 必要测试（33 个测试方法，其中枚举含 369 个恒等用例）
+python demo.py                            # 旧延迟 OPE 三估计演示
+python demo_iteration.py                 # 本轮稳健 IPS 新功能与拒绝边界（90 秒内）
 ```
 
 在仓库根目录执行。`tests/independent_reference.py` 是**独立参考**：它不导入
@@ -26,8 +39,9 @@ python demo.py                            # 约 0.1 秒完成的固定输入演�
 delayed_ope/__init__.py   公开接口
 delayed_ope/core.py       核心算法与全部校验
 tests/independent_reference.py  独立分布参考（不依赖被测核心）
-tests/test_ope.py         必要测试
-demo.py                   固定种子数据生成 + 正常结果 + 两个真实触发的拒绝边界
+tests/test_ope.py         必要测试（旧回归 + 二维独立参照 + 三维稳健 IPS）
+demo.py                   固定种子数据生成 + 旧入口正常结果 + 两个拒绝边界
+demo_iteration.py         本轮稳健 IPS 固定输入演示
 ```
 
 ## 数据结构与接口
@@ -91,6 +105,78 @@ DR 采用标准边际形式：即使日志只记录了一个动作，`m_π(x)` �
 该 context 概率行内的全部动作。q_hat 完美（q̂=条件期望回报）时校正项恒为 0，
 DR 退化为已实现 context 序列上 m_π 的平均值，不再有权重噪声。
 
+## 稳健 IPS：行为概率正闭区间
+
+旧入口 `evaluate(...)` 的原点估计保持不变。新入口使用独立事件类型，因为每条
+记录不再携带自己的单值行为概率；同一 context 的所有动作共享一组变量：
+
+```python
+from delayed_ope import RobustLogEvent, robust_ips
+
+events = [
+    RobustLogEvent(context, action, reward, decision_time, observed_time),
+    ...
+]
+
+result = robust_ips(
+    events,
+    target_policy,       # {context: {action: probability}}，每行归一
+    behavior_intervals,  # {context: {action: (lower, upper)}}，正闭区间
+    cutoff,
+)
+result.minimum.ips
+result.maximum.ips
+result.minimum.behavior_policy       # 达到最小值的完整上下文概率表
+result.maximum.behavior_policy       # 达到最大值的完整上下文概率表
+result.minimum.constraint_checks     # 每个 context 的区间/归一化复核
+```
+
+对每个 context，行为概率向量 `p_a` 必须同时满足：
+
+```text
+0 < lower_a <= p_a <= upper_a <= 1
+Σ_a p_a = 1
+Σ_a lower_a <= 1 <= Σ_a upper_a       # 可行性必要且充分条件
+```
+
+最后一行可行性不满足时立即抛 `InfeasibleProbabilityIntervalsError`，不会自动把
+区间投影或裁剪成“最接近”的概率表。目标策略动作集合必须与该 context 的区间
+动作集合完全一致；奖励可以为正、负或零。成熟样本上的目标为：
+
+```text
+IPS(p) = (1/n_m) Σ_x Σ_a C(x,a) / p_a
+C(x,a) = Σ_{i: mature, x_i=x, a_i=a} π(a|x) r_i
+```
+
+`C(x,a)` 是同一动作多条记录的加权奖励和，因此同一动作上的正负反馈会先抵消。
+一个边界中的同一 context 只选择一张概率表；不会让不同记录分别选择互相矛盾的
+概率。不同 context 的概率变量相互独立，所以总最小值/最大值是各上下文贡献的
+最小值/最大值之和。
+
+### 二维参照与三维算法
+
+对两个动作，令 `q=p_a`、`p_b=1-q`：`f(q) = C_a/q + C_b/(1-q)`。测试中的
+二维独立参照不导入核心优化器，而是直接枚举可行区间端点，并在 `C_a`、`C_b`
+同号时加入驻点
+`q*=sqrt(|C_a|)/(sqrt(|C_a|)+sqrt(|C_b|))`。异号或单系数时函数单调，极值
+在端点；二者同为 0 时整条可行段目标值均为 0。该参照包含同一动作多条正负
+反馈抵消的例子。
+
+核心入口支持每 context 至多 3 个动作。三维情形在“箱约束 ∩ 单纯形”这个紧
+多面体上检查顶点，以及一条或两条变量固定在端点时剩余变量位于区间内部的驻点；
+内点满足一阶条件 `p_a` 与 `sqrt(|C_a|)` 成比例。所有候选点都重新检查区间与
+总和，输出边界再次提供 `constraint_checks`。检查字段包括：
+`feasible_intervals`、`lower_sum`、`upper_sum`、`probability_sum`、
+`max_interval_violation`。
+
+### 范围含义与不做的事
+
+该范围只反映调用方给定的行为概率闭区间。它**不**宣称覆盖奖励噪声、奖励模型
+误差、目标策略错误、上下文分布漂移、未成熟样本选择偏差或其他模型误差。
+稳健入口不做 SNIPS/DR、不接受 clip 参数、不自动截断权重；若最大可能权重超过
+`MAX_WEIGHT`，抛 `WeightOverflowError`。行为概率下界严格为正，因此没有旧入口
+中的 0/0 支持特判。
+
 ## 零支持拒绝（严格）
 
 对**全部事件**（与 cutoff 无关，这是策略与日志的结构性不相容）：若
@@ -121,6 +207,7 @@ DR 退化为已实现 context 序列上 m_π 的平均值，不再有权重噪�
 | `ZeroSupportError` | π>0 而 logged_propensity==0 |
 | `WeightOverflowError` | 成熟样本权重 > 1e300 |
 | `NoMatureSamplesError` | cutoff 前无成熟样本 |
+| `InfeasibleProbabilityIntervalsError` | 稳健入口的正闭区间不满足 Σlower≤1≤Σupper |
 
 - 所有**数值参数**（含 `cutoff`、`clip_value`、概率、reward、时间、q 值）
   拒绝 `NaN` 与正负 `Infinity`；**整数/数值位置拒绝 `bool`**（`True/False`
@@ -134,6 +221,7 @@ DR 退化为已实现 context 序列上 m_π 的平均值，不再有权重噪�
 |---|---|
 | 事件数 | 1,000,000（`MAX_EVENTS`） |
 | 每 context 动作数 | 100,000（`MAX_ACTIONS_PER_CONTEXT`） |
+| 稳健 IPS 每 context 动作数 | 3（`MAX_ROBUST_ACTIONS_PER_CONTEXT`） |
 | 单个重要性权重 | 1e300（`MAX_WEIGHT`，超出抛 `WeightOverflowError`） |
 | 概率行归一容差 | `|Σp − 1| ≤ 1e-9`（`PROB_SUM_TOL`） |
 
@@ -151,6 +239,9 @@ DR 退化为已实现 context 序列上 m_π 的平均值，不再有权重噪�
   仅用宽松统计带（4000 样本、固定种子，|误差|≤0.2）核对；完美 q_hat 的 DR 仍
   按精确口径 `≤1e-12` 核对（校正项必须精确为 0）。
 - 权重与概率为 IEEE-754 binary64；`1/μ` 的相对误差为常规舍入量级（~1e-16）。
+- 稳健 IPS 的候选概率点以 1e-9 级区间/归一容差验收；输出的
+  `max_interval_violation` 通常为 0 或 1e-16 级浮点舍入。二维测试与独立
+  公式比较使用 1e-11 绝对误差口径；不使用随机优化或近似搜索。
 - 本库只实现本题契约的有限数学子集（离散 context/action、实数标量、有限时间
   实数），不宣称任何行业标准协议兼容性。
 
@@ -167,10 +258,16 @@ DR 退化为已实现 context 序列上 m_π 的平均值，不再有权重噪�
    期望恒等且 q̂ 完美时精确无偏；代价是 q_hat 必须覆盖成熟行的全部动作。
 5. **截断是后处理而非唯一输出**：偏差/方差两组数字并列，调用方自行取舍。
 6. 概率表要求对日志中出现的动作**显式列值**，避免“字典漏键被静默当 0”。
+7. **稳健入口按上下文共享变量**：先汇总同动作奖励系数，再优化一张归一化
+   概率表，从模型层面排除逐记录挑选概率的矛盾。
+8. **区间不可满足先拒绝**：不做自动投影；稳健 IPS 也不自动截断权重，避免把
+   区间误差和人为截断偏差混在一起。
 
 ## 已知限制
 
 - 不提供置信区间/SE（可由 `Estimate` 字段在调用方自行 bootstrap）。
+- 稳健 IPS 只覆盖有限 context、每 context 至多 3 个动作的未截断 IPS；不提供
+  通用高维线性分式规划、SNIPS、DR、权重截断或采样近似。
 - 不做随机/上下文 embedding 策略，仅离散概率表；目标策略须为调用方持有的
   完整映射。
 - 不处理同一决策的多值/序列回报、回报删失（censoring）与观察过程的选择性

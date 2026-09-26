@@ -11,6 +11,8 @@ IPS / SNIPS / DR 应当恒等于 V(pi) 的代数恒等式参考值。
 
 from __future__ import annotations
 
+import math
+
 # 固定的小有限世界：2 个上下文，3 个动作。
 CONTEXTS = (0, 1)
 ACTIONS = (0, 1, 2)
@@ -27,3 +29,25 @@ def policy_value(context_p, pi, reward_table):
             row += pi[x][a] * reward_table[x][a]
         total += context_p[x] * row
     return total
+
+
+def two_action_interval_extrema(c0, c1, low0, high0, low1, high1):
+    """二维 f=c0/p+c1/(1-p) 的端点和驻点参照。
+
+    本函数只按一元函数定义枚举，不导入 delayed_ope。返回原始（未除以成熟
+    样本数）最小值、最大值及对应的 p0。
+    """
+    p_low = max(low0, 1.0 - high1)
+    p_high = min(high0, 1.0 - low1)
+    candidates = [p_low, p_high]
+    if (c0 > 0.0 and c1 > 0.0) or (c0 < 0.0 and c1 < 0.0):
+        candidates.append(
+            math.sqrt(abs(c0)) / (math.sqrt(abs(c0)) + math.sqrt(abs(c1))))
+
+    def objective(p):
+        return c0 / p + c1 / (1.0 - p)
+
+    feasible = [p for p in candidates if p_low - 1e-12 <= p <= p_high + 1e-12]
+    p_min = min(feasible, key=objective)
+    p_max = max(feasible, key=objective)
+    return objective(p_min), objective(p_max), p_min, p_max

@@ -10,12 +10,18 @@ from .core import (
     InvalidLogError,
     InvalidPolicyError,
     InvalidQHatError,
+    InfeasibleProbabilityIntervalsError,
     LogEvent,
     NoMatureSamplesError,
     OPEError,
+    RobustConstraintCheck,
+    RobustIPSBound,
+    RobustIPSResult,
+    RobustLogEvent,
     WeightOverflowError,
     ZeroSupportError,
     evaluate,
+    robust_ips,
 )
 
 __all__ = [
@@ -26,8 +32,14 @@ __all__ = [
     "InvalidLogError",
     "InvalidPolicyError",
     "InvalidQHatError",
+    "InfeasibleProbabilityIntervalsError",
     "ZeroSupportError",
     "WeightOverflowError",
     "NoMatureSamplesError",
+    "RobustConstraintCheck",
+    "RobustIPSBound",
+    "RobustIPSResult",
+    "RobustLogEvent",
     "evaluate",
+    "robust_ips",
 ]

@@ -36,20 +36,31 @@ q_hat 完美时校正项恒为 0，DR 即退化为确定性的 m_pi 平均。SNI
 
 对所用权重集合分别计算；正权重时 1 <= ESS <= n_m，全零权重时 ESS = 0。
 
+稳健 IPS（:func:`robust_ips`）将每个 context 的行为概率视为一组共享变量：
+``lower_a <= p_a <= upper_a`` 且 ``Σ p_a = 1``。同一 context 的多条日志不分别
+选择倾向概率；在每 context 至多 3 个动作的闭区间单纯形上枚举顶点、边/面驻点
+和内点驻点，求未截断 IPS 的最小值/最大值。区间不可满足时先拒绝，不做投影。
+
 本模块只实现本题契约的有限数学子集：实数标量、有限时间、离散上下文/动作。
 """
 
 from __future__ import annotations
 
 import math
+from itertools import combinations, product
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 __all__ = [
     "LogEvent",
+    "RobustLogEvent",
     "Estimate",
     "EvaluationResult",
+    "RobustIPSBound",
+    "RobustConstraintCheck",
+    "RobustIPSResult",
     "evaluate",
+    "robust_ips",
     "OPEError",
     "InvalidLogError",
     "InvalidPolicyError",
@@ -62,6 +73,7 @@ __all__ = [
 # ---- 接口边界（题面上限；短演示不必穷举） -------------------------------
 MAX_EVENTS = 1_000_000
 MAX_ACTIONS_PER_CONTEXT = 100_000
+MAX_ROBUST_ACTIONS_PER_CONTEXT = 3
 # 允许的最大权重；比值超过此值视为数值溢出而非合法极大权重。
 MAX_WEIGHT = 1e300
 # 概率归一化容差：每个 context 的动作概率之和必须与 1.0 的偏差在此范围内。
@@ -96,6 +108,10 @@ class NoMatureSamplesError(OPEError):
     """截止时刻前没有任何成熟样本（全部延迟未观测）。"""
 
 
+class InfeasibleProbabilityIntervalsError(InvalidPolicyError):
+    """行为概率正区间与“同一上下文概率和为 1”不相容。"""
+
+
 @dataclass(frozen=True)
 class LogEvent:
     """一条带延迟结算的决策日志。
@@ -122,6 +138,22 @@ class LogEvent:
     logged_propensity: float
     decision_time: float
     observed_time: float
+
+
+@dataclass(frozen=True)
+class RobustLogEvent:
+    """一条行为概率以上下文级区间表示的决策日志。
+
+    与 :class:`LogEvent` 不同，本事件不保存单条记录自己的倾向得分；
+    行为概率由 ``robust_ips`` 的 ``behavior_intervals`` 按上下文统一给出，
+    因而同一上下文的所有动作共享一组求和为 1 的变量。
+    """
+
+    context: object
+    action: object
+    reward: float
+    decision_time: float = 0.0
+    observed_time: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -178,6 +210,50 @@ def _fmt_est(tag: str, est: Estimate) -> str:
         f"[{tag}] IPS={est.ips:.12g}, SNIPS={sn}, DR={dr}, "
         f"ESS={est.ess:.6g}/{est.n}"
     )
+
+
+@dataclass(frozen=True)
+class RobustConstraintCheck:
+    """一个边界概率表在单个上下文上的约束复核结果。"""
+
+    context: object
+    feasible_intervals: bool
+    lower_sum: float
+    upper_sum: float
+    probability_sum: float
+    max_interval_violation: float
+
+
+@dataclass(frozen=True)
+class RobustIPSBound:
+    """稳健 IPS 的一个边界及达到该边界的上下文概率表。"""
+
+    ips: float
+    behavior_policy: dict[object, dict[object, float]]
+    context_contributions: dict[object, float]
+    constraint_checks: tuple[RobustConstraintCheck, ...]
+
+
+@dataclass(frozen=True)
+class RobustIPSResult:
+    """稳健 IPS 的最小值/最大值与成熟样本口径。"""
+
+    cutoff: float
+    n_total: int
+    n_mature: int
+    n_immature: int
+    mature_indices: tuple[int, ...]
+    minimum: RobustIPSBound
+    maximum: RobustIPSBound
+
+    def summary(self) -> str:
+        return "\n".join((
+            f"cutoff={self.cutoff:g}",
+            f"n_total={self.n_total}, n_mature={self.n_mature}, "
+            f"n_immature={self.n_immature}",
+            f"robust IPS range=[{self.minimum.ips:.12g}, "
+            f"{self.maximum.ips:.12g}]",
+        ))
 
 
 def _finite_float(x, what: str) -> float:
@@ -292,6 +368,379 @@ def _make_q_lookup(q_hat: Mapping):
         return v
 
     return lookup
+
+
+def _validate_cutoff(cutoff: float) -> float:
+    if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)):
+        raise InvalidLogError(
+            f"cutoff 必须是有限实数，得到 {type(cutoff).__name__}")
+    cutoff = float(cutoff)
+    if not math.isfinite(cutoff):
+        raise InvalidLogError("cutoff 拒绝 NaN/Infinity")
+    return cutoff
+
+
+def _validate_robust_events(events: Sequence[RobustLogEvent]) -> None:
+    if not isinstance(events, Sequence):
+        raise InvalidLogError(
+            "events 必须是 RobustLogEvent 的序列（Sequence）")
+    if len(events) > MAX_EVENTS:
+        raise InvalidLogError(
+            f"事件数 {len(events)} 超过接口上限 {MAX_EVENTS}")
+    for i, event in enumerate(events):
+        if not isinstance(event, RobustLogEvent):
+            raise InvalidLogError(
+                f"events[{i}] 必须是 RobustLogEvent，得到 "
+                f"{type(event).__name__}")
+        where = f"events[{i}]"
+        _finite_float(event.reward, f"{where}.reward")
+        td = _finite_float(event.decision_time, f"{where}.decision_time")
+        to = _finite_float(event.observed_time, f"{where}.observed_time")
+        if to < td:
+            raise InvalidLogError(
+                f"{where}: observed_time({to:g}) < decision_time({td:g})")
+        try:
+            hash(event.context)
+            hash(event.action)
+        except TypeError as exc:
+            raise InvalidLogError(
+                f"{where}: context/action 必须可哈希") from exc
+
+
+def _validate_robust_target_policy(
+    target_policy: Mapping[object, Mapping[object, float]],
+    events: Sequence[RobustLogEvent],
+) -> None:
+    if not isinstance(target_policy, Mapping):
+        raise InvalidPolicyError(
+            "target_policy 必须是 Mapping[context, Mapping[action, prob]]")
+    contexts = {event.context for event in events}
+    for ctx in contexts:
+        if ctx not in target_policy:
+            raise InvalidPolicyError(
+                f"target_policy 缺少 context {ctx!r} 的动作概率行")
+        row = target_policy[ctx]
+        if not isinstance(row, Mapping) or len(row) == 0:
+            raise InvalidPolicyError(
+                f"target_policy[{ctx!r}] 必须是非空 action->prob Mapping")
+        if len(row) > MAX_ACTIONS_PER_CONTEXT:
+            raise InvalidPolicyError(
+                f"context {ctx!r} 目标动作数 {len(row)} 超过上限 "
+                f"{MAX_ACTIONS_PER_CONTEXT}")
+        total = 0.0
+        for action, probability in row.items():
+            total += _finite_prob(
+                probability,
+                f"target_policy[{ctx!r}][{action!r}]",
+                InvalidPolicyError,
+            )
+        if abs(total - 1.0) > PROB_SUM_TOL:
+            raise InvalidPolicyError(
+                f"context {ctx!r} 的目标概率之和={total!r}，与 1.0 的偏差"
+                f"超过容差 {PROB_SUM_TOL:g}")
+    for i, event in enumerate(events):
+        if event.action not in target_policy[event.context]:
+            raise InvalidPolicyError(
+                f"target_policy[{event.context!r}] 缺少 events[{i}] 的日志"
+                f"动作 {event.action!r}（不支持漏写隐式视为 0）")
+
+
+def _validate_behavior_intervals(
+    behavior_intervals: Mapping[object, Mapping[object, tuple[float, float]]],
+    events: Sequence[RobustLogEvent],
+) -> dict[object, tuple[tuple[object, ...], list[float], list[float]]]:
+    if not isinstance(behavior_intervals, Mapping):
+        raise InvalidPolicyError(
+            "behavior_intervals 必须是 "
+            "Mapping[context, Mapping[action, (lower, upper)]]")
+    parsed: dict[object, tuple[tuple[object, ...], list[float], list[float]]] = {}
+    contexts = {event.context for event in events}
+    for ctx in contexts:
+        if ctx not in behavior_intervals:
+            raise InvalidPolicyError(
+                f"behavior_intervals 缺少 context {ctx!r} 的概率区间行")
+        row = behavior_intervals[ctx]
+        if not isinstance(row, Mapping):
+            raise InvalidPolicyError(
+                f"behavior_intervals[{ctx!r}] 必须是 action->区间 的 Mapping")
+        if len(row) == 0:
+            raise InvalidPolicyError(
+                f"context {ctx!r} 的行为概率区间为空")
+        if len(row) > MAX_ROBUST_ACTIONS_PER_CONTEXT:
+            raise InvalidPolicyError(
+                f"context {ctx!r} 的动作数 {len(row)} 超过稳健 IPS 上限 "
+                f"{MAX_ROBUST_ACTIONS_PER_CONTEXT}")
+        actions = tuple(row.keys())
+        lows: list[float] = []
+        highs: list[float] = []
+        for action in actions:
+            interval = row[action]
+            if not isinstance(interval, tuple | list) or len(interval) != 2:
+                raise InvalidPolicyError(
+                    f"behavior_intervals[{ctx!r}][{action!r}] 必须是 "
+                    "(lower, upper) 二元组")
+            lower = _finite_prob(
+                interval[0],
+                f"behavior_intervals[{ctx!r}][{action!r}].lower",
+                InvalidPolicyError,
+            )
+            upper = _finite_prob(
+                interval[1],
+                f"behavior_intervals[{ctx!r}][{action!r}].upper",
+                InvalidPolicyError,
+            )
+            if lower <= 0.0:
+                raise InvalidPolicyError(
+                    f"behavior_intervals[{ctx!r}][{action!r}].lower 必须是"
+                    f"正数，得到 {lower:g}")
+            if lower > upper:
+                raise InvalidPolicyError(
+                    f"behavior_intervals[{ctx!r}][{action!r}] 下界 "
+                    f"{lower:g} 大于上界 {upper:g}")
+            lows.append(lower)
+            highs.append(upper)
+        lower_sum = math.fsum(lows)
+        upper_sum = math.fsum(highs)
+        if lower_sum > 1.0 + PROB_SUM_TOL or upper_sum < 1.0 - PROB_SUM_TOL:
+            raise InfeasibleProbabilityIntervalsError(
+                f"context {ctx!r} 的行为概率区间不可满足：下界和="
+                f"{lower_sum:g}，上界和={upper_sum:g}；闭区间单纯形要求 "
+                "Σlower <= 1 <= Σupper")
+        parsed[ctx] = (actions, lows, highs)
+    for i, event in enumerate(events):
+        actions = parsed[event.context][0]
+        if event.action not in actions:
+            raise InvalidPolicyError(
+                f"behavior_intervals[{event.context!r}] 缺少 events[{i}] "
+                f"动作 {event.action!r} 的正概率区间")
+    return parsed
+
+
+def _candidate_inside(point, lows, highs, tolerance=1e-10):
+    if abs(math.fsum(point) - 1.0) > PROB_SUM_TOL:
+        return False
+    return all(
+        value > 0.0
+        and value >= low - tolerance
+        and value <= high + tolerance
+        for value, low, high in zip(point, lows, highs))
+
+
+def _stationary_point(indices, total, coefficients):
+    roots = []
+    signs = set()
+    for idx in indices:
+        coefficient = coefficients[idx]
+        if coefficient == 0.0:
+            return None
+        signs.add(1 if coefficient > 0.0 else -1)
+        roots.append(math.sqrt(abs(coefficient)))
+    if len(signs) != 1:
+        return None
+    scale = total / math.fsum(roots)
+    return tuple(scale * root for root in roots)
+
+
+def _optimize_context(actions, lows, highs, coefficients):
+    n = len(actions)
+    if n == 1:
+        if not (lows[0] <= 1.0 <= highs[0]):
+            raise InfeasibleProbabilityIntervalsError(
+                "单动作概率必须等于 1，但区间不包含 1")
+        point = (1.0,)
+        value = math.fsum(coefficients) / 1.0
+        return value, dict(zip(actions, point))
+
+    candidates = []
+
+    # 顶点：至多一个变量不在自己的端点上。
+    for free in range(n):
+        for endpoint_bits in product((0, 1), repeat=n - 1):
+            point = [0.0] * n
+            used = 0.0
+            cursor = 0
+            for idx in range(n):
+                if idx == free:
+                    continue
+                point[idx] = lows[idx] if endpoint_bits[cursor] == 0 else highs[idx]
+                used += point[idx]
+                cursor += 1
+            point[free] = 1.0 - used
+            candidates.append(tuple(point))
+
+    # KKT 面：一组变量位于区间内部，其余变量固定在端点；在面上求驻点。
+    for interior_size in range(2, n + 1):
+        for interior in combinations(range(n), interior_size):
+            fixed = tuple(idx for idx in range(n) if idx not in interior)
+            for endpoint_bits in product((0, 1), repeat=len(fixed)):
+                point = [0.0] * n
+                fixed_sum = 0.0
+                for idx, bit in zip(fixed, endpoint_bits):
+                    point[idx] = lows[idx] if bit == 0 else highs[idx]
+                    fixed_sum += point[idx]
+                remaining = 1.0 - fixed_sum
+                values = _stationary_point(interior, remaining, coefficients)
+                if values is None:
+                    continue
+                for idx, value in zip(interior, values):
+                    point[idx] = value
+                candidates.append(tuple(point))
+
+    feasible = [point for point in candidates
+                if _candidate_inside(point, lows, highs)]
+    if not feasible:
+        raise InfeasibleProbabilityIntervalsError(
+            "概率区间与归一化约束没有找到可行解")
+
+    def objective(point):
+        terms = [coefficient / probability
+                 for coefficient, probability in zip(coefficients, point)]
+        value = math.fsum(terms)
+        if not math.isfinite(value):
+            raise WeightOverflowError(
+                f"稳健 IPS 目标值非有限：系数={coefficients!r}，概率点={point!r}")
+        return value
+
+    best_min = min(feasible, key=objective)
+    best_max = max(feasible, key=objective)
+    return (
+        objective(best_min),
+        dict(zip(actions, best_min)),
+        objective(best_max),
+        dict(zip(actions, best_max)),
+    )
+
+
+def _constraint_check(context, actions, lows, highs, probabilities):
+    sum_probability = math.fsum(probabilities[a] for a in actions)
+    violation = 0.0
+    for action, low, high in zip(actions, lows, highs):
+        value = probabilities[action]
+        violation = max(violation, low - value, value - high, 0.0)
+    lower_sum = math.fsum(lows)
+    upper_sum = math.fsum(highs)
+    feasible = (
+        lower_sum <= 1.0 + PROB_SUM_TOL
+        and upper_sum >= 1.0 - PROB_SUM_TOL
+        and abs(sum_probability - 1.0) <= PROB_SUM_TOL
+        and violation <= PROB_SUM_TOL
+    )
+    return RobustConstraintCheck(
+        context=context,
+        feasible_intervals=feasible,
+        lower_sum=lower_sum,
+        upper_sum=upper_sum,
+        probability_sum=sum_probability,
+        max_interval_violation=max(violation, 0.0),
+    )
+
+
+def robust_ips(
+    events: Sequence[RobustLogEvent],
+    target_policy: Mapping[object, Mapping[object, float]],
+    behavior_intervals: Mapping[object, Mapping[object, tuple[float, float]]],
+    cutoff: float,
+) -> RobustIPSResult:
+    """计算行为概率为正闭区间时未截断 IPS 的最小值和最大值。
+
+    每个 context 的行为动作共享一个概率向量 ``p_a``，满足
+    ``lower_a <= p_a <= upper_a`` 且 ``Σ_a p_a = 1``。同一 context 的多条记录
+    不会分别挑选倾向得分；一个边界使用同一张概率表。目标策略的成熟样本
+    IPS 为 ``(1/n_m) Σ_i π(a_i|x_i) r_i / p_{a_i}``。
+
+    稳健入口仅支持每个 context 至多 3 个行为动作，且不做权重截断。范围只
+    反映传入的倾向区间；不包含奖励、目标策略、未观测过程或其他模型误差。
+    """
+    cutoff = _validate_cutoff(cutoff)
+    _validate_robust_events(events)
+    _validate_robust_target_policy(target_policy, events)
+    parsed = _validate_behavior_intervals(behavior_intervals, events)
+
+    for ctx in {event.context for event in events}:
+        target_actions = set(target_policy[ctx].keys())
+        interval_actions = set(parsed[ctx][0])
+        if target_actions != interval_actions:
+            raise InvalidPolicyError(
+                f"context {ctx!r} 的目标动作集合与行为区间动作集合不一致："
+                f"target={tuple(target_policy[ctx].keys())!r}, "
+                f"intervals={parsed[ctx][0]!r}")
+
+    mature_indices = tuple(
+        index for index, event in enumerate(events)
+        if event.observed_time <= cutoff)
+    if not mature_indices:
+        raise NoMatureSamplesError(
+            f"cutoff={cutoff:g} 前无成熟样本：{len(events)} 条事件的回报"
+            "均尚未观察到；未成熟事件不按 reward=0 计入")
+
+    contexts = tuple(parsed.keys())
+    coefficient_terms = {
+        ctx: [[] for _ in parsed[ctx][0]] for ctx in contexts
+    }
+    for index in mature_indices:
+        event = events[index]
+        actions, _, _ = parsed[event.context]
+        action_index = actions.index(event.action)
+        target_probability = float(
+            target_policy[event.context][event.action])
+        if target_probability > 0.0:
+            lower = parsed[event.context][1][action_index]
+            max_weight = target_probability / lower
+            if not math.isfinite(max_weight) or max_weight > MAX_WEIGHT:
+                raise WeightOverflowError(
+                    f"权重溢出（events[{index}]，成熟样本）：目标概率="
+                    f"{target_probability:g}，行为概率下界={lower:g}，"
+                    f"最大可能权重超过上限 {MAX_WEIGHT:g}；稳健入口不截断权重")
+        coefficient_terms[event.context][action_index].append(
+            target_probability * float(event.reward))
+
+    min_policy = {}
+    max_policy = {}
+    min_contributions = {}
+    max_contributions = {}
+    min_checks = []
+    max_checks = []
+    min_total = 0.0
+    max_total = 0.0
+    n_mature = len(mature_indices)
+
+    for ctx in contexts:
+        actions, lows, highs = parsed[ctx]
+        coefficients = [math.fsum(terms) for terms in coefficient_terms[ctx]]
+        min_value, min_probabilities, max_value, max_probabilities = (
+            _optimize_context(actions, lows, highs, coefficients))
+        min_policy[ctx] = min_probabilities
+        max_policy[ctx] = max_probabilities
+        min_contributions[ctx] = min_value / n_mature
+        max_contributions[ctx] = max_value / n_mature
+        min_total += min_value / n_mature
+        max_total += max_value / n_mature
+        min_checks.append(
+            _constraint_check(ctx, actions, lows, highs, min_probabilities))
+        max_checks.append(
+            _constraint_check(ctx, actions, lows, highs, max_probabilities))
+
+    minimum = RobustIPSBound(
+        ips=min_total,
+        behavior_policy=min_policy,
+        context_contributions=min_contributions,
+        constraint_checks=tuple(min_checks),
+    )
+    maximum = RobustIPSBound(
+        ips=max_total,
+        behavior_policy=max_policy,
+        context_contributions=max_contributions,
+        constraint_checks=tuple(max_checks),
+    )
+    return RobustIPSResult(
+        cutoff=cutoff,
+        n_total=len(events),
+        n_mature=n_mature,
+        n_immature=len(events) - n_mature,
+        mature_indices=mature_indices,
+        minimum=minimum,
+        maximum=maximum,
+    )
 
 
 def _compute_estimates(
